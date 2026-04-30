@@ -1,0 +1,33 @@
+# CHAOS — CHarging Automatically On Solar
+#
+# Quick start:
+#   1. touch chaos.log          # Docker needs the file to exist before bind-mounting it
+#   2. docker compose up -d
+#
+# Multi-architecture build (build once, run on both Apple Silicon and Synology amd64):
+#   docker buildx build --platform linux/amd64,linux/arm64 -t chaos:latest --push .
+#
+# Build for a single platform (local testing or direct Synology deploy):
+#   docker buildx build --platform linux/amd64 -t chaos:latest --load .   # Synology
+#   docker buildx build --platform linux/arm64 -t chaos:latest --load .   # Apple Silicon
+
+services:
+  app:
+    environment:
+      TZ: America/Chicago
+  chaos:
+    build: .
+    # To use a pre-built image instead of building locally, replace the 'build'
+    # directive above with:
+    #   image: chaos:latest
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    volumes:
+      # config.json contains credentials — mount read-only
+      - ./config.json:/app/config.json:ro
+      # chaos.log persists on the host across container restarts
+      - ./chaos.log:/app/chaos.log
+    # Bridge networking (default) routes to the local LAN correctly on all
+    # platforms — macOS, Windows, Linux, and Synology — without needing
+    # --network host. The Powerwall IP in config.json is reached directly.

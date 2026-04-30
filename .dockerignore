@@ -1,0 +1,26 @@
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Credentials and local state — never bake into the image
+config.json
+.powerwall-*
+chaos.log
+
+# Tests — not needed in the image
+test_*.py
+PowerwallTest.py
+
+# Development and documentation
+*.md
+plan-web-ui.md
+chaos_notes.md
+chaos_walkthrough.md
+SampleVehicleInfo.json
+pygal-tooltips.min.js
+
+# Version control
+.git/
+.gitignore

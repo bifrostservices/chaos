@@ -1,0 +1,37 @@
+{
+  "powerwalls": [
+    {
+      "name": "home",
+      "host": "192.168.x.x",
+      "authType": "local",
+      "password": "",
+      "email": "",
+      "timezone": "America/Chicago"
+    }
+  ],
+  "activePowerwall": "home",
+  "lucid": {
+    "username": "",
+    "password": ""
+  },
+  "charging": {
+    "minPowerwallSocPercent": 50,
+    "targetEvChargePercent": 70,
+    "chargerVoltage": 240,
+    "minChargingAmps": 12,
+    "maxChargingAmps": 32,
+    "commandCooldownMinutes": 10,
+    "allowExternalChargeInterference": true
+  },
+  "pollingIntervalSeconds": 60,
+  "dashboard": {
+    "port": 8086,
+    "units": "imperial",
+    "ratedRangeMiles": null,
+    "apiKey": ""
+  },
+  "notifications": {
+    "enabled": false,
+    "webhookUrl": ""
+  }
+}
