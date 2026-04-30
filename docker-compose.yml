@@ -12,20 +12,19 @@
 #   docker buildx build --platform linux/arm64 -t chaos:latest --load .   # Apple Silicon
 
 services:
-  app:
-    environment:
-      TZ: America/Chicago
   chaos:
     build: .
     # To use a pre-built image instead of building locally, replace the 'build'
     # directive above with:
     #   image: chaos:latest
     restart: unless-stopped
+    environment:
+      TZ: America/Chicago
     ports:
       - "8086:8086"
     volumes:
-      # config.json contains credentials — mount read-only
-      - ./config.json:/app/config.json:ro
+      # config.json contains credentials — mount read-write since can change active Powerwall site
+      - ./config.json:/app/config.json
       # chaos.log persists on the host across container restarts
       - ./chaos.log:/app/chaos.log
     # Bridge networking (default) routes to the local LAN correctly on all
