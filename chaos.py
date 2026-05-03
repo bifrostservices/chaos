@@ -45,10 +45,11 @@ from pypowerwall.local.exceptions import LoginError, PowerwallConnectionError
 from lucidmotors import LucidAPI, ChargeState  # type: ignore[attr-defined]
 from lucidmotors.exceptions import APIError
 import fastapi
+import grpc
 import pygal
 import uvicorn
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,12 +80,28 @@ CHARGING_STATES = {
     ChargeState.CHARGE_STATE_AUTHORIZING_EXTERNAL,
 }
 
+def _isUnplugged(chargeState: int) -> bool:
+    """True when the EV cable is not connected at all (not in any plugged-in state)."""
+    return chargeState not in CHARGEABLE_STATES and chargeState not in CHARGING_STATES
+
+
+def _isTransientLucidError(exc: Exception) -> bool:
+    """True for transient gRPC UNAVAILABLE errors that are safe to retry immediately."""
+    return isinstance(exc, APIError) and exc.code == grpc.StatusCode.UNAVAILABLE
+
+
 # Poll-interval multipliers (applied as a factor on pollingIntervalSeconds)
 _INTERVAL_DARK = 10           # No solar production — check infrequently
 _INTERVAL_PW_LOW = 5          # Powerwall SoC too low — wait for recharge
 _INTERVAL_EV_DONE = 60        # EV at target — rarely changes while idle
 _INTERVAL_AFTER_COMMAND = 3   # Let vehicle settle after a start/stop command
+
+# Lucid API retry settings for transient UNAVAILABLE errors
+_LUCID_RETRY_ATTEMPTS = 3
+_LUCID_RETRY_DELAY_SECS = 3
 _CONNECT_TIMEOUT = 15.0       # Seconds before a Powerwall connection attempt times out
+# Solar=0 with a healthy rolling average signals a transient TEDAPI read error (e.g. timeout)
+_SOLAR_ZERO_SUSPECT_W = 200   # Minimum rolling avg (W) that makes a 0W solar reading suspect
 
 
 def loadConfig(path="config.json"):
@@ -226,6 +243,7 @@ class VehicleState:
     evChargingAmps: int = 0  # last commanded AC current limit (0 when not charging)
     lastCommandTime: datetime | None = None   # when the last start/stop was issued
     lastCommandWasStart: bool = False         # True if last command was start; False if stop
+    lastActionDesc: str = ""                  # human-readable description of last decision for dashboard
 
 
 @dataclass
@@ -301,6 +319,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .card{background:#1e293b;border-radius:10px;padding:14px 18px;min-width:130px;border:1px solid #334155}
   .card-label{font-size:.7em;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em}
   .card-value{font-size:1.5em;font-weight:600;margin-top:4px;color:#f1f5f9}
+  .card-sub{font-size:.7em;color:#4ade80;margin-top:2px}
   .card-group-label{font-size:.65em;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 6px}
   .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8em;font-weight:600}
   .g{background:#166534;color:#bbf7d0}.s{background:#374151;color:#9ca3af}
@@ -447,8 +466,8 @@ function refresh(){
       const cardId='card-pw-'+site.name.replace(/\\s+/g,'_');
       const cards='<div class="cards">'
         +'<div class="card"><div class="card-label">Solar</div><div class="card-value">'+kwFmt(site.solarWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(site.homeWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(site.surplusKw)+'</div></div>'
+        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(isActive?Math.max(0,site.homeWatts-d.evChargingKw*1000):site.homeWatts)+'</div></div>'
+        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(isActive?site.surplusKw+d.evChargingKw:site.surplusKw)+'</div></div>'
         +'<div class="card" id="'+cardId+'"><div class="card-label">Powerwall</div><div class="card-value">'+(site.powerwallSocPercent!=null?site.powerwallSocPercent.toFixed(1)+'%':'—')+'</div></div>'
         +(isActive&&d.evChargingKw>0?'<div class="card"><div class="card-label">EV Charging</div><div class="card-value">'+kwFmt(d.evChargingKw*1000)+'</div></div>':'')
         +'</div>';
@@ -480,8 +499,8 @@ function refresh(){
       const evFill=h.evSocPercent!=null?fillTdBg(h.evSocPercent,'rgba(74,222,128,0.18)'):'';
       tr.innerHTML='<td>'+t+'</td>'
         +'<td>'+kwFmt(h.solarWatts)+'</td>'
-        +'<td>'+kwFmt(h.homeWatts)+'</td>'
-        +'<td>'+surpFmt(h.surplusKw)+'</td>'
+        +'<td>'+kwFmt(Math.max(0,h.homeWatts-(h.evChargingKw||0)*1000))+'</td>'
+        +'<td>'+surpFmt(h.surplusKw+(h.evChargingKw||0))+'</td>'
         +'<td '+pwFill+'>'+(h.powerwallSocPercent!=null?h.powerwallSocPercent.toFixed(1)+'%':'—')+'</td>'
         +'<td '+evFill+'>'+(h.evSocPercent!=null?h.evSocPercent+'%':'<span class="muted">—</span>')+'</td>'
         +'<td>'+badge(h.chargeStateName)+'</td>'
@@ -637,7 +656,7 @@ async def _webChartPower():
     n = len(active_hist)
     datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
         ("Solar",       [round(h["solarWatts"] / 1000, 2) for h in active_hist]),
-        ("Home Load",   [round(h["homeWatts"]  / 1000, 2) for h in active_hist]),
+        ("Home Load",   [round((h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
         ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
@@ -715,6 +734,18 @@ class ChargingDecision:
     action: ChargingAction
     targetAmps: int
     reason: str
+
+
+# Maps each ChargingAction to a dashboard Action-column label.
+# ADJUST is excluded — it uses decision.reason directly (e.g. "10A → 12A").
+_ACTION_DESC: dict[ChargingAction, str] = {
+    ChargingAction.NONE:       "",
+    ChargingAction.START:      "start",
+    ChargingAction.STOP:       "stop",
+    ChargingAction.HOLD_MIN:   "hold min",
+    ChargingAction.SKIP_START: "skip start",
+    ChargingAction.OBSERVE:    "observing",
+}
 
 
 def _decideChargingAction(
@@ -948,7 +979,8 @@ async def pollVehicleAndDecide(
         lastCommandWasStart = True
         fireWebhook(webhookUrl, statePayload("charging_started", decision.reason, decision.targetAmps))
 
-    return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart)
+    actionDesc = decision.reason if decision.action == ChargingAction.ADJUST else _ACTION_DESC.get(decision.action, "")
+    return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart, lastActionDesc=actionDesc)
 
 
 def _chargeStateName(chargeState) -> str:
@@ -983,7 +1015,7 @@ def _updateDashboard(
             "chargeStateName": dashState.chargeStateName,
             "evChargingAmps": dashState.evChargingAmps,
             "evChargingKw": dashState.evChargingKw,
-            "action": skipReason or "",
+            "action": skipReason or (cachedState.lastActionDesc if cachedState else ""),
         })
 
 
@@ -1007,6 +1039,36 @@ def _vehicleStateFromProto(vehicle) -> "VehicleState":
         evSocPercent=vehicle.state.battery.charge_percent,
         chargeState=vehicle.state.charging.charge_state,
     )
+
+
+def _shouldForceEarlyEvPoll(
+    history: collections.deque,
+    cachedState: "VehicleState | None",
+    thresholds: "ChargingThresholds",
+) -> bool:
+    """Return True when a home-load spike suggests the EV just plugged in and started charging.
+
+    Conditions (all must be true):
+    - At least two history entries exist (needs a previous reading to compare)
+    - A cached EV state is available (startup guard — avoids first-cycle false positives)
+    - The EV was unplugged at the last poll (cable not connected)
+    - Home load rose by ≥ minChargingAmps × chargerVoltage since the previous cycle
+    - Not currently in post-command cooldown
+    """
+    if len(history) < 2 or cachedState is None:
+        return False
+    if not _isUnplugged(cachedState.chargeState):
+        return False
+    inCooldown = (
+        cachedState.lastCommandTime is not None
+        and (datetime.now(timezone.utc) - cachedState.lastCommandTime).total_seconds()
+        < thresholds.commandCooldownMinutes * 60
+    )
+    if inCooldown:
+        return False
+    minEvLoadKw = thresholds.minChargingAmps * thresholds.chargerVoltage / 1000
+    homeRiseKw = (history[-1]["homeWatts"] - history[-2]["homeWatts"]) / 1000
+    return homeRiseKw >= minEvLoadKw
 
 
 async def processCycle(
@@ -1068,9 +1130,23 @@ async def processCycle(
         )
     else:
         prevCommandTime = cachedState.lastCommandTime if cachedState else None
-        cachedState = await pollVehicleAndDecide(lucid, pwState, thresholds, webhookUrl, cachedState)
+        for attempt in range(_LUCID_RETRY_ATTEMPTS):
+            try:
+                cachedState = await pollVehicleAndDecide(lucid, pwState, thresholds, webhookUrl, cachedState)
+                break
+            except APIError as e:
+                if _isTransientLucidError(e) and attempt < _LUCID_RETRY_ATTEMPTS - 1:
+                    log.warning(
+                        f"{pfx}Transient Lucid API error ({e}), "
+                        f"retrying in {_LUCID_RETRY_DELAY_SECS}s "
+                        f"(attempt {attempt + 1}/{_LUCID_RETRY_ATTEMPTS})..."
+                    )
+                    await asyncio.sleep(_LUCID_RETRY_DELAY_SECS)
+                else:
+                    raise
         # After issuing a start or stop, wait longer before re-polling so the vehicle
         # has time to settle and we don't immediately reverse the command.
+        assert cachedState is not None  # loop only breaks on successful pollVehicleAndDecide
         if cachedState.lastCommandTime != prevCommandTime:
             pollIntervalFactor = max(pollIntervalFactor, _INTERVAL_AFTER_COMMAND)
 
@@ -1155,10 +1231,18 @@ async def _pollOneSite(site: SiteInfo) -> bool:
         solar, home, soc = await asyncio.to_thread(
             lambda: (pw.solar(), pw.home(), pw.level(True))
         )
-        if (solar or 0) == 0 and (home or 0) == 0 and (soc or 0) == 0:
-            site.error = "All-zero reading (transient?)"
-            log.warning(f"[{name}] All-zero reading — skipping update")
-            return False
+        if (solar or 0) == 0:
+            if (home or 0) == 0 and (soc or 0) == 0:
+                site.error = "All-zero reading (transient?)"
+                log.warning(f"[{name}] All-zero reading — skipping update")
+                return False
+            if site.pwState.avgSolarWatts > _SOLAR_ZERO_SUSPECT_W:
+                site.error = f"Suspect zero-solar (avg={site.pwState.avgSolarWatts:.0f}W — likely transient)"
+                log.warning(
+                    f"[{name}] Solar=0W but rolling avg={site.pwState.avgSolarWatts:.0f}W"
+                    " — TEDAPI transient, skipping update"
+                )
+                return False
         site.pwState.update(float(solar or 0), float(home or 0), float(soc or 0))
         site.error = None
         return True
@@ -1281,6 +1365,8 @@ async def runChaos(config):
             log.info(f"Web UI available at http://0.0.0.0:{webUiPort}")
 
         forcedByUser = False
+        forcedEvPollPending = False
+        pendingSwitchAnnotation: str | None = None
         while True:
             try:
                 # Poll ALL sites concurrently; every successful site gets a history entry.
@@ -1289,7 +1375,26 @@ async def runChaos(config):
                     log.warning(f"[{activeName}] Active site PW poll failed — skipping decision cycle")
                     pollIntervalFactor = 1
                 else:
-                    cachedState, pollIntervalFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser, pwState=allSites[activeName].pwState, siteName=activeName)
+                    cachedState, pollIntervalFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
+                    # processCycle succeeded — clear any pending forced EV poll.
+                    forcedEvPollPending = False
+                    # Annotate the first history entry after a site switch.
+                    if pendingSwitchAnnotation and _dashboard.history:
+                        prev = _dashboard.history[-1].get("action", "")
+                        _dashboard.history[-1]["action"] = pendingSwitchAnnotation + (" • " + prev if prev else "")
+                        pendingSwitchAnnotation = None
+                    # Check whether a home-load spike suggests the EV just arrived and plugged in.
+                    # If so, skip the sleep and force an immediate EV poll next cycle.
+                    if _shouldForceEarlyEvPoll(allSites[activeName].history, cachedState, thresholds):
+                        minEvLoadKw = thresholds.minChargingAmps * thresholds.chargerVoltage / 1000
+                        active_hist = allSites[activeName].history
+                        homeRiseKw = (active_hist[-1]["homeWatts"] - active_hist[-2]["homeWatts"]) / 1000
+                        log.info(
+                            f"[{activeName}] Home load spike: +{homeRiseKw:.2f}kW "
+                            f"(≥{minEvLoadKw:.2f}kW threshold) — EV was unplugged, forcing immediate poll"
+                        )
+                        forcedEvPollPending = True
+                        _forcePoll.set()
                 _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
                 _dashboard.lastError = None
             except asyncio.CancelledError:
@@ -1350,10 +1455,12 @@ async def runChaos(config):
                             # Startup connection failed — attempt reconnect now.
                             site.pw = await _connectPowerwall(newPwConfig, newName)
                             site.error = None
+                        oldName = activeName
                         activeName = newName
                         _dashboard.activePowerwall = newName
                         _dashboard.history = allSites[newName].history
                         _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
+                        pendingSwitchAnnotation = f"⇄ {oldName}"
                         await asyncio.to_thread(_writePowerwallToConfig, newName)
                         log.info(f"Active Powerwall switched to '{newName}'.")
                     except Exception as switchErr:

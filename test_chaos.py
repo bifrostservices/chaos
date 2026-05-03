@@ -35,7 +35,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import AsyncClient, ASGITransport
 
+import grpc
 import pytest
+from lucidmotors.exceptions import APIError
 
 from chaos import (
     ChargingAction,
@@ -48,8 +50,11 @@ from chaos import (
     _buildSiteReadings,
     _connectPowerwall,
     _decideChargingAction,
+    _isTransientLucidError,
+    _isUnplugged,
     _pollAllSites,
     _pollOneSite,
+    _shouldForceEarlyEvPoll,
     _webApp,
     _validateConfig,
     _updateDashboard,
@@ -505,6 +510,91 @@ class TestSendWebhook:
 
 
 # ---------------------------------------------------------------------------
+# Home-load spike EV arrival heuristic
+# ---------------------------------------------------------------------------
+
+def _make_thresholds(**overrides):
+    """ChargingThresholds with defaults suitable for heuristic tests."""
+    defaults = dict(
+        minPowerwallSocPercent=20,
+        targetEvChargePercent=80,
+        chargerVoltage=240,
+        minChargingAmps=8,
+        maxChargingAmps=32,
+        commandCooldownMinutes=10,
+        allowExternalChargeInterference=True,
+    )
+    defaults.update(overrides)
+    return ChargingThresholds(**defaults)
+
+
+def _make_history(prev_home: float, curr_home: float) -> collections.deque:
+    """Two-entry history deque with the given home-load values."""
+    hist: collections.deque = collections.deque(maxlen=120)
+    hist.append({"homeWatts": prev_home, "solarWatts": 3000, "surplusKw": 1.0, "powerwallSocPercent": 80, "timestamp": "t0"})
+    hist.append({"homeWatts": curr_home, "solarWatts": 3000, "surplusKw": 1.0, "powerwallSocPercent": 80, "timestamp": "t1"})
+    return hist
+
+
+def _unplugged_state(**overrides) -> VehicleState:
+    """VehicleState where the EV cable is not connected."""
+    return VehicleState(evSocPercent=50, chargeState=CS.CHARGE_STATE_NOT_CONNECTED, **overrides)
+
+
+def _plugged_in_state() -> VehicleState:
+    """VehicleState where the EV is plugged in (cable connected, not charging)."""
+    return VehicleState(evSocPercent=50, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
+
+
+class TestHomeLoadSpikeHeuristic:
+    """Tests for _shouldForceEarlyEvPoll — EV arrival detection via home-load spike."""
+
+    def test_spike_and_unplugged_triggers_poll(self):
+        """Large home-load rise + unplugged EV → should force early poll."""
+        # minChargingAmps=8, chargerVoltage=240 → threshold = 1.92 kW = 1920 W
+        thresholds = _make_thresholds(minChargingAmps=8, chargerVoltage=240)
+        hist = _make_history(prev_home=1000, curr_home=3000)  # +2000 W > 1920 W
+        state = _unplugged_state()
+        assert _shouldForceEarlyEvPoll(hist, state, thresholds) is True
+
+    def test_spike_but_ev_plugged_in_does_not_trigger(self):
+        """Home-load spike is ignored when the EV was already plugged in."""
+        thresholds = _make_thresholds(minChargingAmps=8, chargerVoltage=240)
+        hist = _make_history(prev_home=1000, curr_home=3000)
+        state = _plugged_in_state()
+        assert _shouldForceEarlyEvPoll(hist, state, thresholds) is False
+
+    def test_small_spike_does_not_trigger(self):
+        """A home-load rise below the EV threshold does not force a poll."""
+        thresholds = _make_thresholds(minChargingAmps=8, chargerVoltage=240)
+        hist = _make_history(prev_home=1000, curr_home=1500)  # +500 W < 1920 W
+        state = _unplugged_state()
+        assert _shouldForceEarlyEvPoll(hist, state, thresholds) is False
+
+    def test_spike_and_unplugged_but_in_cooldown_does_not_trigger(self):
+        """Spike is ignored when a recent command is still in cooldown."""
+        thresholds = _make_thresholds(minChargingAmps=8, chargerVoltage=240, commandCooldownMinutes=10)
+        hist = _make_history(prev_home=1000, curr_home=3000)
+        recent = datetime.now(timezone.utc) - timedelta(minutes=2)  # 2 min ago, cooldown=10
+        state = _unplugged_state(lastCommandTime=recent)
+        assert _shouldForceEarlyEvPoll(hist, state, thresholds) is False
+
+    def test_fewer_than_two_history_entries_does_not_trigger(self):
+        """Returns False when there is no previous reading to compare against."""
+        thresholds = _make_thresholds()
+        hist: collections.deque = collections.deque(maxlen=120)
+        hist.append({"homeWatts": 3000, "solarWatts": 3000, "surplusKw": 0.0, "powerwallSocPercent": 80, "timestamp": "t0"})
+        state = _unplugged_state()
+        assert _shouldForceEarlyEvPoll(hist, state, thresholds) is False
+
+    def test_none_cached_state_does_not_trigger(self):
+        """Returns False when no EV state has been cached yet (first cycle)."""
+        thresholds = _make_thresholds()
+        hist = _make_history(prev_home=1000, curr_home=3000)
+        assert _shouldForceEarlyEvPoll(hist, None, thresholds) is False
+
+
+# ---------------------------------------------------------------------------
 # pollVehicleAndDecide — mocked Lucid API
 # ---------------------------------------------------------------------------
 
@@ -611,6 +701,47 @@ class TestPollVehicleAndDecide:
         result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "")
         assert result.chargeState == CS.CHARGE_STATE_ESTABLISHING_SESSION
         assert result.evChargingAmps > 0
+
+
+# ---------------------------------------------------------------------------
+# pollVehicleAndDecide — lastActionDesc populated in returned VehicleState
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPollVehicleAndDecideActionDesc:
+    async def test_start_sets_action_desc(self, thresholds, pw_good):
+        """When charging is started, lastActionDesc should be 'start'."""
+        lucid, _ = _make_lucid_mock()  # default CABLE_CONNECTED — can start
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "")
+        assert result.lastActionDesc == "start"
+
+    async def test_stop_sets_action_desc(self, thresholds):
+        """When charging is stopped (insufficient surplus), lastActionDesc should be 'stop'."""
+        low_pw = PowerwallState(solarWatts=100, homeWatts=3000, powerwallSocPercent=80)
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=16)
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        assert result.lastActionDesc == "stop"
+
+    async def test_adjust_sets_action_desc_with_amps(self, thresholds, pw_good):
+        """When amps are adjusted, lastActionDesc should be the 'XA → YA' reason string."""
+        # Start at min amps; with good surplus, target should be higher
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=thresholds.minChargingAmps)
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert "→" in result.lastActionDesc
+
+    async def test_none_sets_empty_action_desc(self, thresholds, pw_good):
+        """NONE decision (no change needed) → lastActionDesc is empty string."""
+        # Already charging at target amps — surplus matches current draw exactly
+        target_amps = thresholds.maxChargingAmps
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=target_amps)
+        # Set surplus to exactly what target_amps requires — no adjust needed
+        surplus_w = target_amps * thresholds.chargerVoltage
+        pw = PowerwallState(solarWatts=surplus_w + 2000, homeWatts=2000, powerwallSocPercent=80)
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, pw, thresholds, "", prevState=prev)
+        assert result.lastActionDesc == ""
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +981,64 @@ class TestprocessCycleForcedEvPoll:
 
 
 # ---------------------------------------------------------------------------
+# processCycle — transient UNAVAILABLE retry
+# ---------------------------------------------------------------------------
+
+def _make_unavailable_error():
+    return APIError(grpc.StatusCode.UNAVAILABLE, "recvmsg:Connection reset by peer", "")
+
+
+def _make_unauthenticated_error():
+    return APIError(grpc.StatusCode.UNAUTHENTICATED, "invalid token", "")
+
+
+class TestIsTransientLucidError:
+    def test_true_for_unavailable(self):
+        assert _isTransientLucidError(_make_unavailable_error())
+
+    def test_false_for_other_apierror(self):
+        assert not _isTransientLucidError(_make_unauthenticated_error())
+
+    def test_false_for_non_apierror(self):
+        assert not _isTransientLucidError(RuntimeError("oops"))
+
+
+@pytest.mark.asyncio
+class TestProcessCycleTransientRetry:
+    async def test_unavailable_retries_and_succeeds(self, thresholds, pw_good):
+        """UNAVAILABLE on first attempt → retry → success on second."""
+        returned = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
+        pvad = AsyncMock(side_effect=[_make_unavailable_error(), returned])
+        lucid = _make_lucid_processCycle_mock()
+        with patch("chaos.pollVehicleAndDecide", pvad), \
+             patch("chaos.asyncio.sleep", new=AsyncMock()):
+            state, _ = await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, None, forceEvPoll=True, pwState=pw_good)
+        assert pvad.await_count == 2
+        assert state == returned
+
+    async def test_non_transient_apierror_raises_immediately(self, thresholds, pw_good):
+        """Non-UNAVAILABLE APIError is not retried — raises on first attempt."""
+        pvad = AsyncMock(side_effect=_make_unauthenticated_error())
+        lucid = _make_lucid_processCycle_mock()
+        with patch("chaos.pollVehicleAndDecide", pvad), \
+             patch("chaos.asyncio.sleep", new=AsyncMock()), \
+             pytest.raises(APIError):
+            await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, None, forceEvPoll=True, pwState=pw_good)
+        assert pvad.await_count == 1
+
+    async def test_unavailable_all_attempts_raises(self, thresholds, pw_good):
+        """UNAVAILABLE on all 3 attempts → raises after exhausting retries."""
+        err = _make_unavailable_error()
+        pvad = AsyncMock(side_effect=[err, err, err])
+        lucid = _make_lucid_processCycle_mock()
+        with patch("chaos.pollVehicleAndDecide", pvad), \
+             patch("chaos.asyncio.sleep", new=AsyncMock()), \
+             pytest.raises(APIError):
+            await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, None, forceEvPoll=True, pwState=pw_good)
+        assert pvad.await_count == 3
+
+
+# ---------------------------------------------------------------------------
 # _pollOneSite — zero filter and error handling
 # ---------------------------------------------------------------------------
 
@@ -872,7 +1061,7 @@ class TestPollOneSitePwZeroFilter:
         assert site.pwState.solarWatts == 500  # unchanged
 
     async def test_nonzero_home_with_zero_solar_proceeds(self):
-        """Zero solar but non-zero home/SoC is valid (nighttime) — state is updated."""
+        """Zero solar, no prior history (night): avgSolarWatts=0, so NOT flagged as suspect."""
         night_pw = MagicMock()
         night_pw.solar.return_value = 0
         night_pw.home.return_value = 500
@@ -885,6 +1074,37 @@ class TestPollOneSitePwZeroFilter:
         assert result is True
         assert site.error is None
         assert site.pwState.homeWatts == 500
+
+    async def test_zero_solar_with_high_rolling_avg_is_suspect(self):
+        """Solar=0W but rolling avg is healthy — TEDAPI transient error; skipped."""
+        bad_pw = MagicMock()
+        bad_pw.solar.return_value = 0
+        bad_pw.home.return_value = 4175
+        bad_pw.level.return_value = 99
+
+        site = SiteInfo(name="Site", pw=bad_pw,
+                        pwState=PowerwallState(solarWatts=5000, homeWatts=2000, powerwallSocPercent=99))
+
+        result = await _pollOneSite(site)
+
+        assert result is False
+        assert site.error is not None
+        assert site.pwState.solarWatts == 5000  # rolling avg unchanged
+
+    async def test_zero_solar_below_threshold_not_flagged(self):
+        """Solar=0W with low rolling avg (dusk/night) passes through normally."""
+        night_pw = MagicMock()
+        night_pw.solar.return_value = 0
+        night_pw.home.return_value = 2000
+        night_pw.level.return_value = 40
+
+        site = SiteInfo(name="Site", pw=night_pw,
+                        pwState=PowerwallState(solarWatts=100, homeWatts=1000, powerwallSocPercent=50))
+
+        result = await _pollOneSite(site)
+
+        assert result is True
+        assert site.error is None
 
     async def test_exception_sets_error_and_returns_false(self):
         """Exceptions from the pw are caught, stored in site.error, and False is returned."""
