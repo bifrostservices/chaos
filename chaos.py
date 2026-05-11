@@ -86,8 +86,11 @@ def _isUnplugged(chargeState: int) -> bool:
 
 
 def _isTransientLucidError(exc: Exception) -> bool:
-    """True for transient gRPC UNAVAILABLE errors that are safe to retry immediately."""
-    return isinstance(exc, APIError) and exc.code == grpc.StatusCode.UNAVAILABLE
+    """True for transient gRPC errors (UNAVAILABLE or INTERNAL) that are safe to retry."""
+    return isinstance(exc, APIError) and exc.code in (
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.INTERNAL,
+    )
 
 
 # Poll-interval multipliers (applied as a factor on pollingIntervalSeconds)
@@ -96,12 +99,48 @@ _INTERVAL_PW_LOW = 5          # Powerwall SoC too low — wait for recharge
 _INTERVAL_EV_DONE = 60        # EV at target — rarely changes while idle
 _INTERVAL_AFTER_COMMAND = 3   # Let vehicle settle after a start/stop command
 
-# Lucid API retry settings for transient UNAVAILABLE errors
+# Lucid API retry settings for transient errors
 _LUCID_RETRY_ATTEMPTS = 3
 _LUCID_RETRY_DELAY_SECS = 3
 _CONNECT_TIMEOUT = 15.0       # Seconds before a Powerwall connection attempt times out
 # Solar=0 with a healthy rolling average signals a transient TEDAPI read error (e.g. timeout)
 _SOLAR_ZERO_SUSPECT_W = 200   # Minimum rolling avg (W) that makes a 0W solar reading suspect
+_PW_POLL_RETRY_ATTEMPTS = 2   # Retries after a 0W solar transient before giving up
+_PW_POLL_RETRY_DELAY_S = 2.0  # Seconds between retries
+# After a STOP command, the Lucid API may lag a few cycles before reflecting the stopped state.
+# This window suppresses external-session detection and command re-issue during that lag period.
+# It is intentionally much shorter than commandCooldownMinutes so the EV card is not hidden for
+# the entire decision cooldown if the vehicle keeps/resumes charging.
+_STOP_LAG_SECS = 120          # Max seconds of API lag expected after a STOP command
+# Auto site-switch detection: when the EV is confirmed charging but the active site's
+# home load doesn't reflect the expected EV draw, CHAOS suspects the EV is on a different
+# site. Detection requires the mismatch to persist for _AUTO_SWITCH_CYCLES_REQUIRED
+# consecutive cycles to avoid reacting to transient load spikes or one-cycle ADJUST lag.
+_AUTO_SWITCH_CYCLES_REQUIRED = 3    # consecutive mismatch cycles before switching
+_AUTO_SWITCH_LOAD_RATIO = 0.5       # fraction of expectedEvPower used as load threshold
+
+
+async def _lucidCallWithRetry(coro_fn, prefix: str = "") -> Any:
+    """Call an async Lucid API function with retry on transient errors."""
+    pfx = f"{prefix} " if prefix else ""
+    for attempt in range(_LUCID_RETRY_ATTEMPTS):
+        try:
+            return await coro_fn()
+        except APIError as e:
+            if _isTransientLucidError(e) and attempt < _LUCID_RETRY_ATTEMPTS - 1:
+                log.warning(
+                    f"{pfx}Transient Lucid API error ({e}), "
+                    f"retrying in {_LUCID_RETRY_DELAY_SECS}s "
+                    f"(attempt {attempt + 1}/{_LUCID_RETRY_ATTEMPTS})..."
+                )
+                await asyncio.sleep(_LUCID_RETRY_DELAY_SECS)
+            else:
+                raise
+
+
+async def _lucidLoginWithRetry(lucid, lucidConfig: dict) -> None:
+    """Log in to the Lucid API with retries for transient server errors."""
+    await _lucidCallWithRetry(lambda: lucid.login(lucidConfig["username"], lucidConfig["password"]))
 
 
 def loadConfig(path="config.json"):
@@ -151,7 +190,8 @@ def powerwallCacheFile(activeName: str, host: str) -> str:
 
 
 class PowerwallState:
-    """Holds the latest Powerwall reading and maintains a rolling solar average.
+    """Holds the latest Powerwall reading and maintains rolling averages for solar
+    and home load.
 
     The constructor mirrors the old dataclass signature so existing call-sites
     and tests that build a one-shot instance require no changes.  A persistent
@@ -168,6 +208,7 @@ class PowerwallState:
         powerwallSocPercent: float = 0,
     ) -> None:
         self._solarHistory: collections.deque = collections.deque(maxlen=self._HISTORY_SIZE)
+        self._homeHistory:  collections.deque = collections.deque(maxlen=self._HISTORY_SIZE)
         self.solarWatts: float = max(0, solarWatts or 0)
         self.homeWatts: float = homeWatts or 0
         self.powerwallSocPercent: float = powerwallSocPercent or 0
@@ -176,17 +217,25 @@ class PowerwallState:
         # history; the first update() call will populate it.
         if self.solarWatts > 0:
             self._solarHistory.append(self.solarWatts)
+        if self.homeWatts > 0:
+            self._homeHistory.append(self.homeWatts)
 
     def update(self, solarWatts: float, homeWatts: float, powerwallSocPercent: float) -> None:
-        """Record a new Powerwall reading and advance the rolling solar average."""
+        """Record a new Powerwall reading and advance the rolling averages."""
         self.solarWatts = max(0, solarWatts or 0)
         self.homeWatts = homeWatts or 0
         self.powerwallSocPercent = powerwallSocPercent or 0
         self._solarHistory.append(self.solarWatts)
+        self._homeHistory.append(self.homeWatts)
         if abs(self.avgSolarWatts - self.solarWatts) > 50:
             log.info(
                 f"Solar rolling avg: {self.avgSolarWatts:.0f}W  "
                 f"(raw: {self.solarWatts:.0f}W  over {len(self._solarHistory)} sample(s))"
+            )
+        if abs(self.avgHomeWatts - self.homeWatts) > 1000:
+            log.info(
+                f"Home rolling avg: {self.avgHomeWatts:.0f}W  "
+                f"(raw: {self.homeWatts:.0f}W  over {len(self._homeHistory)} sample(s))"
             )
 
     @property
@@ -201,9 +250,39 @@ class PowerwallState:
         return sum(self._solarHistory) / len(self._solarHistory)
 
     @property
+    def avgHomeWatts(self) -> float:
+        """Rolling mean of the last ``_HISTORY_SIZE`` home-load readings.
+
+        Falls back to the current raw reading when history has not yet been
+        populated (e.g. a one-shot test instance that was never ``update()``d).
+        """
+        if not self._homeHistory:
+            return self.homeWatts
+        return sum(self._homeHistory) / len(self._homeHistory)
+
+    @property
     def surplusKw(self) -> float:
-        """Smoothed solar minus home load in kW; positive = excess available for EV."""
-        return (self.avgSolarWatts - self.homeWatts) / 1000
+        """Smoothed surplus in kW: rolling-avg solar minus rolling-avg home load.
+
+        Using averaged home prevents a single transient home-load spike from
+        immediately triggering a STOP command.
+        """
+        return (self.avgSolarWatts - self.avgHomeWatts) / 1000
+
+    def updateSoc(self, powerwallSocPercent: float) -> None:
+        """Update only the Powerwall SoC — used during solar transients where
+        `solarWatts` is unreliable but SoC is still valid."""
+        self.powerwallSocPercent = powerwallSocPercent or 0
+
+    def resetHomeHistory(self) -> None:
+        """Discard stale home-load history after an EV charge-state transition.
+
+        Home load changes significantly when the EV starts or stops charging (by the
+        EV's full charging draw).  Old readings from the previous regime would skew
+        ``avgHomeWatts`` — and therefore ``effectiveSurplusKw`` — for 2–3 cycles,
+        potentially causing an over-allocation immediately after a START.
+        """
+        self._homeHistory.clear()
 
     @property
     def isDark(self) -> bool:
@@ -215,6 +294,7 @@ class PowerwallState:
             f"PowerwallState(solar={self.solarWatts:.0f}W"
             f" avg={self.avgSolarWatts:.0f}W"
             f" home={self.homeWatts:.0f}W"
+            f" avgHome={self.avgHomeWatts:.0f}W"
             f" surplus={self.surplusKw:+.2f}kW"
             f" soc={self.powerwallSocPercent:.1f}%)"
         )
@@ -272,6 +352,7 @@ class DashboardState:
 
 _dashboard = DashboardState()
 _allSites: dict = {}  # dict[str, SiteInfo]; set in runChaos; read by chart endpoints
+_autoSwitchConsecutiveCount: dict[str, int] = {}  # consecutive mismatch cycles per candidate site
 _NON_ACTIVE_SOLAR_COLOR = "rgba(255, 240, 100, 0.85)"  # light yellow — deemphasized variant of active Solar (#fbbf24)
 _NON_ACTIVE_HOME_COLOR  = "rgba(56, 189, 248, 0.45)"   # dimmed sky   — matches active Home Load (#38bdf8)
 _NON_ACTIVE_PW_COLOR    = "rgba(255, 240, 100, 0.85)"  # light yellow — matches non-active Solar color for visual consistency
@@ -466,8 +547,8 @@ function refresh(){
       const cardId='card-pw-'+site.name.replace(/\\s+/g,'_');
       const cards='<div class="cards">'
         +'<div class="card"><div class="card-label">Solar</div><div class="card-value">'+kwFmt(site.solarWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(isActive?Math.max(0,site.homeWatts-d.evChargingKw*1000):site.homeWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(isActive?site.surplusKw+d.evChargingKw:site.surplusKw)+'</div></div>'
+        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(isActive?(d.evChargingKw*1000<site.homeWatts?site.homeWatts-d.evChargingKw*1000:site.homeWatts):site.homeWatts)+'</div></div>'
+        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(site.surplusKw)+'</div></div>'
         +'<div class="card" id="'+cardId+'"><div class="card-label">Powerwall</div><div class="card-value">'+(site.powerwallSocPercent!=null?site.powerwallSocPercent.toFixed(1)+'%':'—')+'</div></div>'
         +(isActive&&d.evChargingKw>0?'<div class="card"><div class="card-label">EV Charging</div><div class="card-value">'+kwFmt(d.evChargingKw*1000)+'</div></div>':'')
         +'</div>';
@@ -499,8 +580,8 @@ function refresh(){
       const evFill=h.evSocPercent!=null?fillTdBg(h.evSocPercent,'rgba(74,222,128,0.18)'):'';
       tr.innerHTML='<td>'+t+'</td>'
         +'<td>'+kwFmt(h.solarWatts)+'</td>'
-        +'<td>'+kwFmt(Math.max(0,h.homeWatts-(h.evChargingKw||0)*1000))+'</td>'
-        +'<td>'+surpFmt(h.surplusKw+(h.evChargingKw||0))+'</td>'
+        +'<td>'+kwFmt((h.evChargingKw||0)*1000<h.homeWatts?h.homeWatts-(h.evChargingKw||0)*1000:h.homeWatts)+'</td>'
+        +'<td>'+surpFmt(h.surplusKw)+'</td>'
         +'<td '+pwFill+'>'+(h.powerwallSocPercent!=null?h.powerwallSocPercent.toFixed(1)+'%':'—')+'</td>'
         +'<td '+evFill+'>'+(h.evSocPercent!=null?h.evSocPercent+'%':'<span class="muted">—</span>')+'</td>'
         +'<td>'+badge(h.chargeStateName)+'</td>'
@@ -656,7 +737,7 @@ async def _webChartPower():
     n = len(active_hist)
     datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
         ("Solar",       [round(h["solarWatts"] / 1000, 2) for h in active_hist]),
-        ("Home Load",   [round((h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
+        ("Home Load",   [round(max(0.0, h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
         ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
@@ -850,7 +931,7 @@ async def pollVehicleAndDecide(
     # a few cycles before reflecting the stopped state, so prevEvChargingAmps is temporarily 0
     # while the API still reports CHARGING. During this window, hold state and wait for
     # the API to confirm the stop rather than re-issuing commands.
-    recentStop = inCooldown and not lastCommandWasStart
+    recentStop = commandAgeSecs < _STOP_LAG_SECS and not lastCommandWasStart
     isCharging = chargeState in CHARGING_STATES
     canCharge = chargeState in CHARGEABLE_STATES
 
@@ -880,8 +961,11 @@ async def pollVehicleAndDecide(
     evChargingKw = prevEvChargingAmps * thresholds.chargerVoltage / 1000
     effectiveSurplusKw = pwState.surplusKw + evChargingKw
 
-    # Target amps floored to whole amps; clamped to [0, maxChargingAmps]
-    targetAmps = max(0, min(thresholds.maxChargingAmps, int(effectiveSurplusKw * 1000 / thresholds.chargerVoltage)))
+    # Target amps: floored to whole amps, clamped to [0, maxChargingAmps], and
+    # hard-capped to floor(solarWatts / chargerVoltage) so we never command the
+    # EV to draw more than the panels are currently producing.
+    maxSolarAmps = int(pwState.solarWatts / thresholds.chargerVoltage)
+    targetAmps = max(0, min(thresholds.maxChargingAmps, maxSolarAmps, int(effectiveSurplusKw * 1000 / thresholds.chargerVoltage)))
 
     log.info(
         f"Solar={pwState.solarWatts:.0f}W  Home={pwState.homeWatts:.0f}W  "
@@ -926,6 +1010,7 @@ async def pollVehicleAndDecide(
     if decision.action == ChargingAction.STOP:
         log.info(f"Stopping charge: {decision.reason}")
         await lucid.stop_charging(vehicle)
+        pwState.resetHomeHistory()   # home load drops by ~EV draw; stale readings now skew avg
         chargeState = ChargeState.CHARGE_STATE_CHARGING_STOPPED
         evChargingAmps = 0
         lastCommandTime = now
@@ -973,11 +1058,20 @@ async def pollVehicleAndDecide(
         await lucid.set_charge_limit(vehicle, int(thresholds.targetEvChargePercent))
         await lucid.set_ac_current_limit(vehicle, decision.targetAmps)
         await lucid.start_charging(vehicle)
+        pwState.resetHomeHistory()   # home load rises by ~EV draw; stale readings now skew avg
         chargeState = ChargeState.CHARGE_STATE_ESTABLISHING_SESSION
         evChargingAmps = decision.targetAmps
         lastCommandTime = now
         lastCommandWasStart = True
         fireWebhook(webhookUrl, statePayload("charging_started", decision.reason, decision.targetAmps))
+
+    # Car is not actively charging and we didn't just start it — clear the cached commanded
+    # amps so the dashboard doesn't show stale EV load (e.g. after the vehicle self-terminates
+    # at CHARGING_END_OK without CHAOS issuing a STOP command).
+    if not isCharging and decision.action != ChargingAction.START:
+        if prevEvChargingAmps > 0:
+            pwState.resetHomeHistory()   # home load dropped; stale readings now skew avg
+        evChargingAmps = 0
 
     actionDesc = decision.reason if decision.action == ChargingAction.ADJUST else _ACTION_DESC.get(decision.action, "")
     return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart, lastActionDesc=actionDesc)
@@ -1101,7 +1195,7 @@ async def processCycle(
             await lucid.authentication_refresh()
         except APIError as e:
             log.warning(f"Auth refresh failed ({e}), re-logging in to Lucid...")
-            await lucid.login(lucidConfig["username"], lucidConfig["password"])
+            await _lucidLoginWithRetry(lucid, lucidConfig)
 
     # --- Decide whether to poll Lucid ---
     # Always poll if currently charging (may need to stop), on first cycle, or forced by user.
@@ -1130,23 +1224,13 @@ async def processCycle(
         )
     else:
         prevCommandTime = cachedState.lastCommandTime if cachedState else None
-        for attempt in range(_LUCID_RETRY_ATTEMPTS):
-            try:
-                cachedState = await pollVehicleAndDecide(lucid, pwState, thresholds, webhookUrl, cachedState)
-                break
-            except APIError as e:
-                if _isTransientLucidError(e) and attempt < _LUCID_RETRY_ATTEMPTS - 1:
-                    log.warning(
-                        f"{pfx}Transient Lucid API error ({e}), "
-                        f"retrying in {_LUCID_RETRY_DELAY_SECS}s "
-                        f"(attempt {attempt + 1}/{_LUCID_RETRY_ATTEMPTS})..."
-                    )
-                    await asyncio.sleep(_LUCID_RETRY_DELAY_SECS)
-                else:
-                    raise
+        cachedState = await _lucidCallWithRetry(
+            lambda: pollVehicleAndDecide(lucid, pwState, thresholds, webhookUrl, cachedState),
+            prefix=pfx.strip(),
+        )
         # After issuing a start or stop, wait longer before re-polling so the vehicle
         # has time to settle and we don't immediately reverse the command.
-        assert cachedState is not None  # loop only breaks on successful pollVehicleAndDecide
+        assert cachedState is not None
         if cachedState.lastCommandTime != prevCommandTime:
             pollIntervalFactor = max(pollIntervalFactor, _INTERVAL_AFTER_COMMAND)
 
@@ -1220,6 +1304,43 @@ def _buildSiteReadings(allSites: dict, activeName: str) -> list:
     ]
 
 
+def _detectSiteSwitch(
+    allSites: dict,
+    activeName: str,
+    cachedState: VehicleState,
+    thresholds: ChargingThresholds,
+) -> str | None:
+    """Return the name of a non-active site if the EV appears to be charging there, else None.
+
+    Conditions (all must hold):
+    - EV is confirmed charging at >= minChargingAmps
+    - Active site homeWatts < expectedEvPower * _AUTO_SWITCH_LOAD_RATIO  (missing EV load)
+    - Exactly one non-active site has homeWatts >= expectedEvPower * _AUTO_SWITCH_LOAD_RATIO
+      and no active poll error  (unambiguous candidate)
+    """
+    if cachedState.chargeState not in CHARGING_STATES:
+        return None
+    evAmps = cachedState.evChargingAmps
+    if evAmps < thresholds.minChargingAmps:
+        return None
+    expectedEvW = evAmps * thresholds.chargerVoltage
+    threshold = expectedEvW * _AUTO_SWITCH_LOAD_RATIO
+
+    activeSite = allSites[activeName]
+    if activeSite.pwState.homeWatts >= threshold:
+        return None  # Active site load is consistent with hosting the EV
+
+    candidates = [
+        name
+        for name, site in allSites.items()
+        if name != activeName
+        and not site.error
+        and site.pwState.homeWatts >= threshold
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+
 async def _pollOneSite(site: SiteInfo) -> bool:
     """Poll one site's Powerwall state (solar/home/soc). Returns True on success."""
     pw = site.pw
@@ -1228,21 +1349,33 @@ async def _pollOneSite(site: SiteInfo) -> bool:
     try:
         # Lambda groups all three synchronous Powerwall calls into one thread invocation
         # so the event loop doesn't pay the thread-pool dispatch overhead three times.
-        solar, home, soc = await asyncio.to_thread(
-            lambda: (pw.solar(), pw.home(), pw.level(True))
-        )
+        _pw_read = lambda: (pw.solar(), pw.home(), pw.level(True))
+        solar, home, soc = await asyncio.to_thread(_pw_read)
         if (solar or 0) == 0:
             if (home or 0) == 0 and (soc or 0) == 0:
                 site.error = "All-zero reading (transient?)"
                 log.warning(f"[{name}] All-zero reading — skipping update")
                 return False
             if site.pwState.avgSolarWatts > _SOLAR_ZERO_SUSPECT_W:
-                site.error = f"Suspect zero-solar (avg={site.pwState.avgSolarWatts:.0f}W — likely transient)"
-                log.warning(
-                    f"[{name}] Solar=0W but rolling avg={site.pwState.avgSolarWatts:.0f}W"
-                    " — TEDAPI transient, skipping update"
-                )
-                return False
+                # 0W solar with a healthy rolling average suggests a transient read failure
+                # (e.g. ConnectionResetError inside pypowerwall). Retry before giving up.
+                for attempt in range(_PW_POLL_RETRY_ATTEMPTS):
+                    log.warning(
+                        f"[{name}] Solar=0W but rolling avg={site.pwState.avgSolarWatts:.0f}W"
+                        f" — retrying ({attempt + 1}/{_PW_POLL_RETRY_ATTEMPTS})"
+                    )
+                    await asyncio.sleep(_PW_POLL_RETRY_DELAY_S)
+                    solar, home, soc = await asyncio.to_thread(_pw_read)
+                    if (solar or 0) > 0:
+                        break  # retry recovered a valid reading
+                if (solar or 0) == 0:
+                    log.warning(
+                        f"[{name}] Solar=0W after {_PW_POLL_RETRY_ATTEMPTS} retries"
+                        " — 0W solar transient, skipping solar update"
+                    )
+                    if (soc or 0) > 0:
+                        site.pwState.updateSoc(float(soc))
+                    return False
         site.pwState.update(float(solar or 0), float(home or 0), float(soc or 0))
         site.error = None
         return True
@@ -1314,7 +1447,7 @@ async def runChaos(config):
 
     async with LucidAPI() as lucid:
         log.info("Logging in to Lucid API...")
-        await lucid.login(lucidConfig["username"], lucidConfig["password"])
+        await _lucidLoginWithRetry(lucid, lucidConfig)
         log.info("Lucid API authenticated.")
 
         vehicles = await lucid.fetch_vehicles()
@@ -1367,6 +1500,17 @@ async def runChaos(config):
         forcedByUser = False
         forcedEvPollPending = False
         pendingSwitchAnnotation: str | None = None
+
+        async def _doSiteSwitch(newName: str, annotation: str) -> None:
+            """Update shared state when switching the active site. Caller logs and does extras."""
+            nonlocal activeName, pendingSwitchAnnotation
+            oldName = activeName
+            activeName = newName
+            _dashboard.activePowerwall = newName
+            _dashboard.history = allSites[newName].history
+            pendingSwitchAnnotation = f"{annotation} {oldName}"
+            await asyncio.to_thread(_writePowerwallToConfig, newName)
+
         while True:
             try:
                 # Poll ALL sites concurrently; every successful site gets a history entry.
@@ -1375,6 +1519,7 @@ async def runChaos(config):
                     log.warning(f"[{activeName}] Active site PW poll failed — skipping decision cycle")
                     pollIntervalFactor = 1
                 else:
+                    prevCommandTime = cachedState.lastCommandTime if cachedState else None
                     cachedState, pollIntervalFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
                     # processCycle succeeded — clear any pending forced EV poll.
                     forcedEvPollPending = False
@@ -1395,6 +1540,45 @@ async def runChaos(config):
                         )
                         forcedEvPollPending = True
                         _forcePoll.set()
+                    # Auto-detect site switch: if EV is charging but the active site's home load
+                    # doesn't reflect the expected EV draw, check if a non-active site fits better.
+                    # Skip detection immediately after a command (load may not have settled yet).
+                    if len(allSites) > 1 and cachedState is not None:
+                        if cachedState.lastCommandTime != prevCommandTime:
+                            _autoSwitchConsecutiveCount.clear()
+                        else:
+                            candidate = _detectSiteSwitch(allSites, activeName, cachedState, thresholds)
+                            if candidate:
+                                _autoSwitchConsecutiveCount[candidate] = _autoSwitchConsecutiveCount.get(candidate, 0) + 1
+                                count = _autoSwitchConsecutiveCount[candidate]
+                                log.info(
+                                    f"[{activeName}] Auto-switch candidate '{candidate}': "
+                                    f"cycle {count}/{_AUTO_SWITCH_CYCLES_REQUIRED} "
+                                    f"(active home={allSites[activeName].pwState.homeWatts:.0f}W, "
+                                    f"candidate home={allSites[candidate].pwState.homeWatts:.0f}W, "
+                                    f"expected EV≥{cachedState.evChargingAmps * thresholds.chargerVoltage:.0f}W)"
+                                )
+                                if count >= _AUTO_SWITCH_CYCLES_REQUIRED:
+                                    log.warning(
+                                        f"Auto-switching active site '{activeName}' → '{candidate}' "
+                                        f"after {_AUTO_SWITCH_CYCLES_REQUIRED} consecutive mismatch cycles"
+                                    )
+                                    oldName = activeName  # capture before _doSiteSwitch updates it
+                                    allSites[candidate].pwState.resetHomeHistory()
+                                    await _doSiteSwitch(candidate, "🔄")
+                                    fireWebhook(
+                                        webhookUrl,
+                                        {
+                                            "text": f"🔄 CHAOS auto-switched active site: '{oldName}' → '{candidate}'",
+                                            "event": "auto_site_switch",
+                                            "from": oldName,
+                                            "to": candidate,
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        },
+                                    )
+                                    _autoSwitchConsecutiveCount.clear()
+                            else:
+                                _autoSwitchConsecutiveCount.clear()
                 _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
                 _dashboard.lastError = None
             except asyncio.CancelledError:
@@ -1455,13 +1639,7 @@ async def runChaos(config):
                             # Startup connection failed — attempt reconnect now.
                             site.pw = await _connectPowerwall(newPwConfig, newName)
                             site.error = None
-                        oldName = activeName
-                        activeName = newName
-                        _dashboard.activePowerwall = newName
-                        _dashboard.history = allSites[newName].history
-                        _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
-                        pendingSwitchAnnotation = f"⇄ {oldName}"
-                        await asyncio.to_thread(_writePowerwallToConfig, newName)
+                        await _doSiteSwitch(newName, "⇄")
                         log.info(f"Active Powerwall switched to '{newName}'.")
                     except Exception as switchErr:
                         log.warning(f"Failed to switch to Powerwall '{newName}': {switchErr}")

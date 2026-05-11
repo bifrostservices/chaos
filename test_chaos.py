@@ -50,8 +50,10 @@ from chaos import (
     _buildSiteReadings,
     _connectPowerwall,
     _decideChargingAction,
+    _detectSiteSwitch,
     _isTransientLucidError,
     _isUnplugged,
+    _lucidLoginWithRetry,
     _pollAllSites,
     _pollOneSite,
     _shouldForceEarlyEvPoll,
@@ -178,6 +180,55 @@ class TestPowerwallState:
     def test_is_dark_night_none_input(self):
         pw = PowerwallState(solarWatts=None, homeWatts=None, powerwallSocPercent=None)  # type: ignore
         assert pw.isDark is True
+
+    def test_avg_home_one_shot_instance(self):
+        """One-shot instance: avgHomeWatts equals the seeded homeWatts."""
+        pw = PowerwallState(solarWatts=5000, homeWatts=3000, powerwallSocPercent=80)
+        assert pw.avgHomeWatts == pytest.approx(3000.0)
+
+    def test_avg_home_empty_history_fallback(self):
+        """No-arg instance has empty history: avgHomeWatts falls back to homeWatts."""
+        pw = PowerwallState()
+        assert pw.avgHomeWatts == pytest.approx(0.0)
+
+    def test_avg_home_smooths_spike(self):
+        """A single home spike is dampened by the rolling average."""
+        pw = PowerwallState(solarWatts=6000, homeWatts=3000, powerwallSocPercent=80)
+        pw.update(6000, 3000, 80)   # second sample: still 3000W
+        pw.update(6000, 11000, 80)  # spike: 11000W home
+        # avg = (3000 + 3000 + 11000) / 3 ≈ 5667W, not 11000W
+        assert pw.avgHomeWatts == pytest.approx((3000 + 3000 + 11000) / 3)
+        # surplusKw uses avg home, not raw home — should not show a massive deficit
+        assert pw.surplusKw > (6000 - 11000) / 1000  # better than raw-home surplus
+
+    def test_surplus_uses_avg_home_not_raw(self):
+        """surplusKw must use avgHomeWatts so one bad cycle doesn't cause a false STOP."""
+        pw = PowerwallState(solarWatts=6500, homeWatts=6500, powerwallSocPercent=80)
+        pw.update(6500, 6500, 80)
+        pw.update(6500, 11500, 80)  # spike — would trigger STOP if using raw home
+        # With avg home = (6500 + 6500 + 11500) / 3 ≈ 8167W: surplus ≈ -1.67kW
+        # With raw home = 11500W:                              surplus = -5.0kW
+        expected_avg_home = (6500 + 6500 + 11500) / 3
+        assert pw.surplusKw == pytest.approx((6500 - expected_avg_home) / 1000)
+
+    def test_reset_home_history_clears_stale_readings(self):
+        """After resetHomeHistory(), avgHomeWatts falls back to the current raw reading."""
+        pw = PowerwallState(solarWatts=7000, homeWatts=1500, powerwallSocPercent=60)
+        pw.update(7000, 1500, 60)
+        pw.update(7000, 7000, 60)   # EV started — history now [1500, 1500, 7000]
+        assert pw.avgHomeWatts == pytest.approx((1500 + 1500 + 7000) / 3)  # stale avg
+
+        pw.resetHomeHistory()
+        # After reset, empty history → fallback to raw homeWatts (7000W)
+        assert pw.avgHomeWatts == pytest.approx(7000.0)
+
+    def test_reset_home_history_next_update_seeds_fresh(self):
+        """After resetHomeHistory(), the next update() starts fresh from a single sample."""
+        pw = PowerwallState(solarWatts=7000, homeWatts=1500, powerwallSocPercent=60)
+        pw.update(7000, 1500, 60)
+        pw.resetHomeHistory()
+        pw.update(7000, 7000, 60)   # first post-reset reading (EV now charging)
+        assert pw.avgHomeWatts == pytest.approx(7000.0)  # only 1 sample — no stale contamination
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +753,84 @@ class TestPollVehicleAndDecide:
         assert result.chargeState == CS.CHARGE_STATE_ESTABLISHING_SESSION
         assert result.evChargingAmps > 0
 
+    async def test_target_amps_capped_at_solar_production(self, thresholds):
+        """targetAmps must never exceed floor(solarWatts / chargerVoltage)."""
+        # 7000W solar → max 29A (7000/240). With large effectiveSurplus that would
+        # otherwise compute 35+A, the solar cap must bring it back to 29A.
+        solar_w = 7000  # floor(7000/240) = 29A
+        pw = PowerwallState(solarWatts=solar_w, homeWatts=1500, powerwallSocPercent=80)
+        # prevAmps=29A → evChargingKw=6.96kW; effectiveSurplus≈(7000−1500)/1000+6.96=12.46kW→51A before cap
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=29,
+        )
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, pw, thresholds, "", prevState=prev)
+        if lucid.set_ac_current_limit.called:
+            commanded_amps = lucid.set_ac_current_limit.call_args[0][1]
+            assert commanded_amps <= solar_w // int(thresholds.chargerVoltage)
+
+    async def test_reset_home_history_called_after_start(self, thresholds, pw_good):
+        """Home history must be cleared after issuing a START so stale low-load readings
+        don't inflate effectiveSurplusKw on the next cycle."""
+        lucid, _ = _make_lucid_mock()
+        # Seed home history with low (pre-EV) readings
+        pw_good.update(pw_good.solarWatts, 1500, 80)
+        pw_good.update(pw_good.solarWatts, 1500, 80)
+        assert len(pw_good._homeHistory) >= 2
+        await pollVehicleAndDecide(lucid, pw_good, thresholds, "")
+        lucid.start_charging.assert_awaited_once()
+        # History should be empty after the reset so the next update builds fresh
+        assert len(pw_good._homeHistory) == 0
+
+    async def test_reset_home_history_called_after_stop(self, thresholds):
+        """Home history must be cleared after a STOP so stale high-load (EV) readings
+        don't depress surplusKw on the following cycle."""
+        low_pw = PowerwallState(solarWatts=100, homeWatts=3000, powerwallSocPercent=80)
+        # Seed home history with high (EV-inclusive) readings
+        low_pw.update(100, 7500, 80)
+        low_pw.update(100, 7500, 80)
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=16)
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        lucid.stop_charging.assert_awaited_once()
+        assert len(low_pw._homeHistory) == 0
+
+    async def test_vehicle_self_terminates_clears_ev_charging_amps(self, thresholds, pw_good):
+        """When vehicle self-stops at target (CHARGING_END_OK), evChargingAmps must be
+        cleared to 0 even though CHAOS issued no STOP command."""
+        prev = VehicleState(
+            evSocPercent=thresholds.targetEvChargePercent,
+            chargeState=CS.CHARGE_STATE_CHARGING_END_OK,
+            evChargingAmps=16,
+        )
+        lucid, _ = _make_lucid_mock(
+            evSocPercent=thresholds.targetEvChargePercent,
+            chargeState=CS.CHARGE_STATE_CHARGING_END_OK,
+        )
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        lucid.stop_charging.assert_not_awaited()   # vehicle self-stopped; CHAOS issues no STOP
+        assert result.evChargingAmps == 0
+
+    async def test_vehicle_self_terminates_resets_home_history(self, thresholds, pw_good):
+        """After vehicle self-stop, resetHomeHistory() should clear stale home averages."""
+        prev = VehicleState(
+            evSocPercent=thresholds.targetEvChargePercent,
+            chargeState=CS.CHARGE_STATE_CHARGING_END_OK,
+            evChargingAmps=16,
+        )
+        lucid, _ = _make_lucid_mock(
+            evSocPercent=thresholds.targetEvChargePercent,
+            chargeState=CS.CHARGE_STATE_CHARGING_END_OK,
+        )
+        # Pre-fill home history with high-EV readings
+        for _ in range(3):
+            pw_good.update(5000, 4500, 80)
+        assert len(pw_good._homeHistory) == 3
+        await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert len(pw_good._homeHistory) == 0
+
 
 # ---------------------------------------------------------------------------
 # pollVehicleAndDecide — lastActionDesc populated in returned VehicleState
@@ -988,6 +1117,10 @@ def _make_unavailable_error():
     return APIError(grpc.StatusCode.UNAVAILABLE, "recvmsg:Connection reset by peer", "")
 
 
+def _make_internal_error():
+    return APIError(grpc.StatusCode.INTERNAL, "Login call failed.", "")
+
+
 def _make_unauthenticated_error():
     return APIError(grpc.StatusCode.UNAUTHENTICATED, "invalid token", "")
 
@@ -996,11 +1129,56 @@ class TestIsTransientLucidError:
     def test_true_for_unavailable(self):
         assert _isTransientLucidError(_make_unavailable_error())
 
+    def test_true_for_internal(self):
+        assert _isTransientLucidError(_make_internal_error())
+
     def test_false_for_other_apierror(self):
         assert not _isTransientLucidError(_make_unauthenticated_error())
 
     def test_false_for_non_apierror(self):
         assert not _isTransientLucidError(RuntimeError("oops"))
+
+
+@pytest.mark.asyncio
+class TestLucidLoginWithRetry:
+    async def test_succeeds_on_first_attempt(self):
+        lucid = MagicMock()
+        lucid.login = AsyncMock()
+        await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        lucid.login.assert_awaited_once_with("u", "p")
+
+    async def test_retries_on_internal_error_and_succeeds(self):
+        """INTERNAL on first attempt → retry → success on second."""
+        lucid = MagicMock()
+        lucid.login = AsyncMock(side_effect=[_make_internal_error(), None])
+        with patch("chaos.asyncio.sleep", new=AsyncMock()):
+            await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        assert lucid.login.await_count == 2
+
+    async def test_retries_on_unavailable_and_succeeds(self):
+        """UNAVAILABLE on first attempt → retry → success on second."""
+        lucid = MagicMock()
+        lucid.login = AsyncMock(side_effect=[_make_unavailable_error(), None])
+        with patch("chaos.asyncio.sleep", new=AsyncMock()):
+            await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        assert lucid.login.await_count == 2
+
+    async def test_raises_after_all_attempts_exhausted(self):
+        """Transient error on all 3 attempts → raises after last attempt."""
+        err = _make_internal_error()
+        lucid = MagicMock()
+        lucid.login = AsyncMock(side_effect=[err, err, err])
+        with patch("chaos.asyncio.sleep", new=AsyncMock()), pytest.raises(APIError):
+            await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        assert lucid.login.await_count == 3
+
+    async def test_raises_immediately_on_non_transient_error(self):
+        """Non-transient error (e.g. UNAUTHENTICATED) is not retried."""
+        lucid = MagicMock()
+        lucid.login = AsyncMock(side_effect=_make_unauthenticated_error())
+        with patch("chaos.asyncio.sleep", new=AsyncMock()), pytest.raises(APIError):
+            await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        assert lucid.login.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1076,7 +1254,7 @@ class TestPollOneSitePwZeroFilter:
         assert site.pwState.homeWatts == 500
 
     async def test_zero_solar_with_high_rolling_avg_is_suspect(self):
-        """Solar=0W but rolling avg is healthy — TEDAPI transient error; skipped."""
+        """Solar=0W but rolling avg is healthy — 0W solar transient; skipped."""
         bad_pw = MagicMock()
         bad_pw.solar.return_value = 0
         bad_pw.home.return_value = 4175
@@ -1088,8 +1266,92 @@ class TestPollOneSitePwZeroFilter:
         result = await _pollOneSite(site)
 
         assert result is False
-        assert site.error is not None
+        assert site.error is None  # transient: don't pollute dashboard error state
         assert site.pwState.solarWatts == 5000  # rolling avg unchanged
+
+    async def test_zero_solar_transient_updates_soc_when_valid(self):
+        """During a 0W solar transient, SoC is still valid — must update powerwallSocPercent."""
+        bad_pw = MagicMock()
+        bad_pw.solar.return_value = 0
+        bad_pw.home.return_value = 4175
+        bad_pw.level.return_value = 97.5   # valid SoC
+
+        site = SiteInfo(name="Site", pw=bad_pw,
+                        pwState=PowerwallState(solarWatts=5000, homeWatts=2000, powerwallSocPercent=60.0))
+
+        result = await _pollOneSite(site)
+
+        assert result is False
+        assert site.pwState.solarWatts == 5000  # solar unchanged (rolling avg protected)
+        assert site.pwState.powerwallSocPercent == 97.5  # SoC updated from valid reading
+
+    async def test_zero_solar_transient_skips_soc_update_when_soc_zero(self):
+        """During an all-zero transient (solar=0, soc=0), don't overwrite SoC with 0."""
+        bad_pw = MagicMock()
+        bad_pw.solar.return_value = 0
+        bad_pw.home.return_value = 4175
+        bad_pw.level.return_value = 0   # SoC also zero (bad reading)
+
+        site = SiteInfo(name="Site", pw=bad_pw,
+                        pwState=PowerwallState(solarWatts=5000, homeWatts=2000, powerwallSocPercent=85.0))
+
+        result = await _pollOneSite(site)
+
+        assert result is False
+        assert site.pwState.powerwallSocPercent == 85.0  # stale reading preserved, not overwritten with 0
+
+    async def test_zero_solar_retry_succeeds_on_second_attempt(self):
+        """Retry recovers a valid solar reading — full update applied, no transient skip."""
+        pw = MagicMock()
+        call_count = 0
+
+        def fake_poll():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, 4000, 90)   # first poll: solar=0 (transient)
+            return (3500, 4000, 91)    # retry: valid
+
+        pw.solar.side_effect = lambda: fake_poll()[0]
+        pw.home.side_effect = lambda: fake_poll()[1]
+        pw.level.side_effect = lambda _=None: fake_poll()[2]
+
+        # Use side_effect on the lambda by mocking to_thread differently:
+        # Easier: have solar/home/level called inside the lambda independently.
+        # Reset and use a simpler approach with call index on solar only.
+        pw2 = MagicMock()
+        solar_calls = iter([0, 3500])
+        pw2.solar.side_effect = lambda: next(solar_calls)
+        pw2.home.return_value = 4000
+        pw2.level.return_value = 91
+
+        site = SiteInfo(name="Site", pw=pw2,
+                        pwState=PowerwallState(solarWatts=5000, homeWatts=2000, powerwallSocPercent=80.0))
+
+        with patch("chaos.asyncio.sleep", new_callable=AsyncMock):
+            result = await _pollOneSite(site)
+
+        assert result is True
+        assert site.pwState.solarWatts == 3500   # retry value used
+        assert site.error is None
+
+    async def test_zero_solar_retry_exhausted_falls_back_to_transient(self):
+        """All retries return 0W solar — falls back to transient handling (SoC updated, solar skipped)."""
+        bad_pw = MagicMock()
+        bad_pw.solar.return_value = 0
+        bad_pw.home.return_value = 4000
+        bad_pw.level.return_value = 88
+
+        site = SiteInfo(name="Site", pw=bad_pw,
+                        pwState=PowerwallState(solarWatts=5000, homeWatts=2000, powerwallSocPercent=70.0))
+
+        with patch("chaos.asyncio.sleep", new_callable=AsyncMock):
+            result = await _pollOneSite(site)
+
+        assert result is False
+        assert site.pwState.solarWatts == 5000        # solar rolling avg unchanged
+        assert site.pwState.powerwallSocPercent == 88  # SoC updated from valid reading
+        assert site.error is None
 
     async def test_zero_solar_below_threshold_not_flagged(self):
         """Solar=0W with low rolling avg (dusk/night) passes through normally."""
@@ -1311,6 +1573,24 @@ class TestExternalCharge:
         result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
         # Must not treat this as external — vehicle amps (16A) must not appear on result
         assert result.evChargingAmps == 0
+
+    async def test_external_session_detected_after_stop_lag_window(self, thresholds, pw_good):
+        """Once the API-lag window (_STOP_LAG_SECS) has passed, charging after a STOP is treated
+        as a new external session, not post-stop API lag.  The EV card must be restored."""
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 16
+
+        # STOP was issued 3 minutes ago — well past the _STOP_LAG_SECS (120s) window
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=0,
+            lastCommandTime=datetime.now(timezone.utc) - timedelta(minutes=3),
+            lastCommandWasStart=False,
+        )
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        # External session detected — evChargingAmps must reflect actual charging
+        assert result.evChargingAmps > 0
 
 
 # ---------------------------------------------------------------------------
@@ -2464,3 +2744,105 @@ class TestWebChartMultiSite:
             async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
                 resp = await client.get("/api/charts/power.svg")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# _detectSiteSwitch
+# ---------------------------------------------------------------------------
+
+def _make_thresholds_for_detect(**overrides):
+    return _make_thresholds(minChargingAmps=6, **overrides)
+
+def _make_sites_for_detect(active_home: float, candidate_home: float, candidate_error: str | None = None):
+    """Two-site dict: 'Active' and 'Candidate' with given home load values."""
+    active = SiteInfo(
+        name="Active", pw=MagicMock(),
+        pwState=PowerwallState(solarWatts=6000, homeWatts=active_home, powerwallSocPercent=60),
+    )
+    candidate = SiteInfo(
+        name="Candidate", pw=MagicMock(),
+        pwState=PowerwallState(solarWatts=5000, homeWatts=candidate_home, powerwallSocPercent=55),
+        error=candidate_error,
+    )
+    return {"Active": active, "Candidate": candidate}
+
+
+class TestDetectSiteSwitch:
+    """Tests for _detectSiteSwitch — auto-detect when EV is on a different site."""
+
+    T = _make_thresholds_for_detect()  # 6A min, 240V → expectedEvW = amps*240
+
+    def _state(self, chargeState, evAmps: int):
+        return VehicleState(evSocPercent=70.0, chargeState=chargeState, evChargingAmps=evAmps)
+
+    def test_no_switch_ev_not_charging(self):
+        """Returns None when EV is not in a charging state."""
+        state = self._state(CS.CHARGE_STATE_CHARGING_STOPPED, evAmps=20)
+        sites = _make_sites_for_detect(active_home=500, candidate_home=5000)
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_no_switch_ev_below_min_amps(self):
+        """Returns None when evChargingAmps is below minChargingAmps."""
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=3)  # below min of 6
+        sites = _make_sites_for_detect(active_home=500, candidate_home=5000)
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_no_switch_active_site_has_ev_load(self):
+        """Returns None when the active site's homeWatts >= 50% of expected EV power."""
+        # 20A * 240V = 4800W expected; threshold = 2400W; active home = 3000W → OK
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        sites = _make_sites_for_detect(active_home=3000, candidate_home=5000)
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_no_switch_no_candidate(self):
+        """Returns None when no non-active site has sufficient home load."""
+        # 20A * 240V = 4800W; threshold = 2400W; candidate home = 1000W < 2400W
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        sites = _make_sites_for_detect(active_home=500, candidate_home=1000)
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_no_switch_ambiguous_candidates(self):
+        """Returns None when multiple non-active sites are candidates (ambiguous)."""
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        # active_home = 500W (below threshold); two non-active sites both with high home load
+        active = SiteInfo(
+            name="Active", pw=MagicMock(),
+            pwState=PowerwallState(solarWatts=6000, homeWatts=500, powerwallSocPercent=60),
+        )
+        siteB = SiteInfo(
+            name="SiteB", pw=MagicMock(),
+            pwState=PowerwallState(solarWatts=5000, homeWatts=5000, powerwallSocPercent=55),
+        )
+        siteC = SiteInfo(
+            name="SiteC", pw=MagicMock(),
+            pwState=PowerwallState(solarWatts=5000, homeWatts=5000, powerwallSocPercent=55),
+        )
+        sites = {"Active": active, "SiteB": siteB, "SiteC": siteC}
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_no_switch_candidate_has_error(self):
+        """Returns None when the only candidate site has an active poll error."""
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        sites = _make_sites_for_detect(active_home=500, candidate_home=5000, candidate_error="Connection refused")
+        assert _detectSiteSwitch(sites, "Active", state, self.T) is None
+
+    def test_detects_candidate_site(self):
+        """Returns the candidate site name when all conditions are met."""
+        # 20A * 240V = 4800W; threshold = 2400W
+        # active home = 500W < 2400W; candidate home = 5000W >= 2400W
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        sites = _make_sites_for_detect(active_home=500, candidate_home=5000)
+        assert _detectSiteSwitch(sites, "Active", state, self.T) == "Candidate"
+
+    def test_detects_only_non_active_sites_considered(self):
+        """Active site is never returned as a candidate, even with high home load."""
+        state = self._state(CS.CHARGE_STATE_CHARGING, evAmps=20)
+        # active_home is low AND candidate is the active site — function is called with
+        # activeName="Candidate", so "Candidate" should not be returned
+        sites = _make_sites_for_detect(active_home=5000, candidate_home=500)
+        # Both have roles reversed: activeName="Candidate" has low home load → should detect "Active"
+        active_site = sites["Active"]
+        candidate_site = sites["Candidate"]
+        reversed_sites = {"Candidate": candidate_site, "Active": active_site}
+        # "Candidate" is now active with 500W; "Active" non-active with 5000W
+        assert _detectSiteSwitch(reversed_sites, "Candidate", state, self.T) == "Active"
