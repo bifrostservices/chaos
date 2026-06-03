@@ -27,6 +27,7 @@
 import asyncio
 import collections
 import json
+import logging
 import tempfile
 import pathlib
 from contextlib import contextmanager
@@ -290,6 +291,7 @@ def _decide(
     lastCommandWasStart=False,
     effectiveSurplusKw=2.4,
     evSocPercent=50.0,
+    chargingEnabled=True,
 ):
     return _decideChargingAction(
         isCharging=isCharging,
@@ -303,6 +305,7 @@ def _decide(
         pwState=pw,
         effectiveSurplusKw=effectiveSurplusKw,
         evSocPercent=evSocPercent,
+        chargingEnabled=chargingEnabled,
     )
 
 
@@ -993,6 +996,283 @@ class TestGracefulShutdown:
 
             # runChaos should return cleanly when CancelledError propagates from processCycle
             await runChaos(config)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Decoupled PW / EV polling — runChaos loop behavior
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDecoupledPolling:
+    """Verify PW polls every cycle while EV polls only when nextEvPollDue has elapsed."""
+
+    def _make_config(self, polling_interval=99999):
+        return {
+            "activePowerwall": "test",
+            "powerwalls": [
+                {
+                    "name": "test",
+                    "host": "192.168.1.1",
+                    "password": "pw",
+                    "email": "test@example.com",
+                    "timezone": "UTC",
+                    "authType": "local",
+                }
+            ],
+            "lucid": {"username": "u", "password": "p"},
+            "charging": {
+                "minPowerwallSocPercent": 50,
+                "targetEvChargePercent": 80,
+                "chargerVoltage": 240,
+                "minChargingAmps": 12,
+                "maxChargingAmps": 32,
+                "commandCooldownMinutes": 10,
+            },
+            "notifications": {"enabled": False},
+            "pollingIntervalSeconds": polling_interval,
+            "dashboard": {"port": None},  # disable web server in tests
+        }
+
+    def _make_poll_mock(self, *, cancel_on_call: int):
+        """Return an async mock for _pollAllSites that raises CancelledError on the Nth call."""
+        call_count = [0]
+
+        async def mock_poll(allSites):
+            call_count[0] += 1
+            site = allSites["test"]
+            site.error = None
+            site.pwState.update(1000, 500, 80)
+            if call_count[0] >= cancel_on_call:
+                raise asyncio.CancelledError
+
+        return mock_poll, call_count
+
+    async def test_pw_polls_every_cycle_ev_only_when_due(self, thresholds):
+        """PW is polled each cycle; EV (processCycle) is only called when nextEvPollDue has elapsed.
+
+        With pollingIntervalSeconds=99999 and evPollFactor=1, after the first EV poll
+        nextEvPollDue is ~99999s in the future. Subsequent PW-only wakeups skip the EV poll.
+        """
+        from chaos import runChaos, _forcePoll
+
+        config = self._make_config(polling_interval=99999)
+        lucid_mock, vehicle_mock = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        pw_poll_mock, pw_call_count = self._make_poll_mock(cancel_on_call=3)
+
+        ev_call_count = [0]
+        cached = MagicMock()
+        cached.lastCommandTime = None
+        cached.chargeState = CS.CHARGE_STATE_CABLE_CONNECTED
+        cached.evChargingAmps = 0
+
+        async def mock_process_cycle(*args, **kwargs):
+            ev_call_count[0] += 1
+            return cached, 1  # evPollFactor=1 → nextEvPollDue = now + 99999s
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        with (
+            patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+            patch("chaos.LucidAPI") as MockLucidAPI,
+            patch("chaos._pollAllSites", new=pw_poll_mock),
+            patch("chaos.processCycle", new=mock_process_cycle),
+            patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+        ):
+            MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+            MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+            _forcePoll.clear()
+
+            await runChaos(config)
+
+        # _pollAllSites called on all 3 cycles (3rd raises CancelledError)
+        assert pw_call_count[0] == 3
+        # processCycle only called on cycle 1 (nextEvPollDue = now+99999s after that)
+        assert ev_call_count[0] == 1
+
+    async def test_forced_poll_triggers_ev_regardless_of_due_time(self, thresholds):
+        """When _forcePoll fires, the EV is polled even if nextEvPollDue is far in the future."""
+        from chaos import runChaos
+
+        config = self._make_config(polling_interval=99999)
+        lucid_mock, vehicle_mock = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        pw_poll_mock, pw_call_count = self._make_poll_mock(cancel_on_call=3)
+
+        ev_call_count = [0]
+        cached = MagicMock()
+        cached.lastCommandTime = None
+        cached.chargeState = CS.CHARGE_STATE_CABLE_CONNECTED
+        cached.evChargingAmps = 0
+
+        async def mock_process_cycle(*args, **kwargs):
+            ev_call_count[0] += 1
+            return cached, 1
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        with (
+            patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+            patch("chaos.LucidAPI") as MockLucidAPI,
+            patch("chaos._pollAllSites", new=pw_poll_mock),
+            patch("chaos.processCycle", new=mock_process_cycle),
+            patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+        ):
+            MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+            MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+            # Pre-set _forcePoll so the first sleep wakes immediately with forcedByUser=True,
+            # resetting nextEvPollDue to datetime.min and triggering a second EV poll on cycle 2.
+            # Use a fresh event created in this test's event loop to avoid loop-binding conflicts.
+            import chaos as _chaos_module
+            fresh_force_poll = asyncio.Event()
+            fresh_force_poll.set()
+            with patch.object(_chaos_module, "_forcePoll", fresh_force_poll):
+                await runChaos(config)
+
+        # PW polled on all 3 cycles
+        assert pw_call_count[0] == 3
+        # EV polled on cycle 1 (datetime.min) and again on cycle 2 (forced wake reset nextEvPollDue)
+        assert ev_call_count[0] == 2
+
+    async def test_next_poll_at_reflects_pw_cadence_not_ev_due_time(self, thresholds):
+        """nextPollAt must show the next PW wakeup (≤ pwSleep), not nextEvPollDue.
+
+        Regression test for bug where nextPollAt was set to nextEvPollDue: when evPollFactor
+        is large (e.g. _INTERVAL_EV_DONE=60 and pollingIntervalSeconds=60), nextEvPollDue is
+        ~3600s in the future, causing the dashboard to show "next update in 59min" instead of
+        the actual PW cadence (≤60s).
+        """
+        from chaos import runChaos, _dashboard, _INTERVAL_EV_DONE
+        import chaos as _chaos_module
+
+        config = self._make_config(polling_interval=60)
+        lucid_mock, vehicle_mock = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        # Cancel on cycle 2 — lets cycle 1 complete (including sleep + nextPollAt assignment)
+        pw_poll_mock, pw_call_count = self._make_poll_mock(cancel_on_call=2)
+
+        cached = MagicMock()
+        cached.lastCommandTime = None
+        cached.chargeState = CS.CHARGE_STATE_CABLE_CONNECTED
+        cached.evChargingAmps = 0
+
+        async def mock_process_cycle(*args, **kwargs):
+            # EV at target: evPollFactor=60 → nextEvPollDue = now + 60*60 = 3600s
+            return cached, _INTERVAL_EV_DONE
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        fresh_force_poll = asyncio.Event()
+        with (
+            patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+            patch("chaos.LucidAPI") as MockLucidAPI,
+            patch("chaos._pollAllSites", new=pw_poll_mock),
+            patch("chaos.processCycle", new=mock_process_cycle),
+            patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+            patch.object(_chaos_module, "_forcePoll", fresh_force_poll),
+        ):
+            MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+            MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            t_before = datetime.now(timezone.utc)
+            await runChaos(config)
+
+        # nextPollAt must reflect next PW wakeup (≤ pwSleep ≈ 0.001s + test overhead),
+        # NOT nextEvPollDue (≈ 3600s). Allow generous buffer for test execution time.
+        assert _dashboard.nextPollAt is not None
+        poll_lag = (_dashboard.nextPollAt - t_before).total_seconds()
+        assert poll_lag < 60, (
+            f"nextPollAt is {poll_lag:.1f}s from test start; "
+            f"expected ≤60s (PW cadence), not ~3600s (EV due time)"
+        )
+
+    async def test_site_switch_forces_ev_poll(self, thresholds):
+        """After a _switchPowerwall event, the EV is polled even if nextEvPollDue is far future.
+
+        Regression test for bug where switching Powerwalls did not reset forcedEvPollPending,
+        so the EV could go unpolled for a long time after the switch.
+        """
+        from chaos import runChaos, _INTERVAL_EV_DONE
+        import chaos as _chaos_module
+
+        # Two-site config so the switch has a valid target
+        config = {
+            "activePowerwall": "Site1",
+            "powerwalls": [
+                {"name": "Site1", "host": "192.168.1.1", "password": "pw", "email": "t@t.com", "timezone": "UTC", "authType": "local"},
+                {"name": "Site2", "host": "192.168.1.2", "password": "pw", "email": "t@t.com", "timezone": "UTC", "authType": "local"},
+            ],
+            "lucid": {"username": "u", "password": "p"},
+            "charging": {
+                "minPowerwallSocPercent": 50, "targetEvChargePercent": 80,
+                "chargerVoltage": 240, "minChargingAmps": 12,
+                "maxChargingAmps": 32, "commandCooldownMinutes": 10,
+            },
+            "notifications": {"enabled": False},
+            "pollingIntervalSeconds": 99999,
+            "dashboard": {"port": None},
+        }
+
+        lucid_mock, _ = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        poll_call_count = [0]
+
+        async def mock_poll(allSites):
+            poll_call_count[0] += 1
+            for site in allSites.values():
+                site.error = None
+                site.pwState.update(1000, 500, 80)
+            if poll_call_count[0] == 3:
+                raise asyncio.CancelledError
+
+        ev_call_count = [0]
+        cached = MagicMock()
+        cached.lastCommandTime = None
+        cached.chargeState = CS.CHARGE_STATE_CABLE_CONNECTED
+        cached.evChargingAmps = 0
+
+        async def mock_process_cycle(*args, **kwargs):
+            ev_call_count[0] += 1
+            if ev_call_count[0] == 1:
+                # Signal the switch during cycle 1 so the switch handler fires before cycle 2
+                _chaos_module._pendingPowerwallName = "Site2"
+                fresh_switch_pw.set()
+            # Return a big factor so without the fix nextEvPollDue would skip cycle 2
+            return cached, _INTERVAL_EV_DONE
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        fresh_force_poll = asyncio.Event()
+        fresh_switch_pw = asyncio.Event()
+
+        with (
+            patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+            patch("chaos.LucidAPI") as MockLucidAPI,
+            patch("chaos._pollAllSites", new=mock_poll),
+            patch("chaos.processCycle", new=mock_process_cycle),
+            patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+            patch("chaos._writePowerwallToConfig"),
+            patch.object(_chaos_module, "_forcePoll", fresh_force_poll),
+            patch.object(_chaos_module, "_switchPowerwall", fresh_switch_pw),
+        ):
+            MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+            MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+            await runChaos(config)
+
+        # Cycle 1: EV polled (nextEvPollDue starts at datetime.min)
+        # Cycle 2: switch fires between cycles → forcedEvPollPending=True → EV polled again
+        # Cycle 3: CancelledError (no EV poll)
+        assert ev_call_count[0] >= 2, (
+            f"Expected EV to be polled after site switch, but processCycle called {ev_call_count[0]} time(s)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2846,3 +3126,149 @@ class TestDetectSiteSwitch:
         reversed_sites = {"Candidate": candidate_site, "Active": active_site}
         # "Candidate" is now active with 500W; "Active" non-active with 5000W
         assert _detectSiteSwitch(reversed_sites, "Candidate", state, self.T) == "Active"
+
+
+# ---------------------------------------------------------------------------
+# Charging enable/disable
+# ---------------------------------------------------------------------------
+
+class TestChargingDisabled:
+    """Tests for _decideChargingAction with chargingEnabled=False."""
+
+    def test_disabled_while_charging_gives_stop(self, thresholds, pw_good):
+        d = _decide(thresholds, pw_good, isCharging=True, targetAmps=16, chargingEnabled=False)
+        assert d.action == ChargingAction.STOP
+        assert "disabled" in d.reason
+
+    def test_disabled_while_not_charging_gives_none(self, thresholds, pw_good):
+        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingEnabled=False)
+        assert d.action == ChargingAction.NONE
+        assert "disabled" in d.reason
+
+    def test_disabled_overrides_cooldown_and_stops(self, thresholds, pw_good):
+        """Even if in cooldown (which would normally hold), disabled always stops."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            inCooldown=True,
+            lastCommandWasStart=True,
+            chargingEnabled=False,
+        )
+        assert d.action == ChargingAction.STOP
+
+    def test_enabled_true_is_default_behaviour(self, thresholds, pw_good):
+        """Explicit chargingEnabled=True should behave identically to the default."""
+        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingEnabled=True)
+        assert d.action == ChargingAction.START
+
+    @pytest.mark.asyncio
+    async def test_disabled_uses_ev_done_poll_factor(self, thresholds, pw_good):
+        """Charging disabled → processCycle skips EV poll with factor == _INTERVAL_EV_DONE."""
+        import chaos
+        from chaos import processCycle, _INTERVAL_EV_DONE
+
+        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
+        pvad = AsyncMock()
+        chaos._chargingEnabled = False
+        try:
+            with patch("chaos.pollVehicleAndDecide", pvad):
+                _, factor = await processCycle(
+                    _make_lucid_processCycle_mock(), thresholds, "",
+                    {"username": "u", "password": "p"}, cached, pwState=pw_good,
+                )
+            pvad.assert_not_awaited()
+            assert factor == _INTERVAL_EV_DONE
+        finally:
+            chaos._chargingEnabled = True
+
+
+class TestWebApiCharging:
+    """Tests for POST /api/charging endpoint."""
+
+    def test_disable_sets_global_triggers_poll_and_logs(self, caplog):
+        import chaos
+        from starlette.testclient import TestClient
+
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t", "action": "adjust 10→12A"})
+        with caplog.at_level(logging.INFO, logger="chaos"):
+            with TestClient(_webApp) as client:
+                r = client.post("/api/charging", json={"enabled": False})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "chargingEnabled": False}
+        assert chaos._chargingEnabled is False
+        assert chaos._forcePoll.is_set()
+        assert any("disabled" in m for m in caplog.messages)
+        assert chaos._dashboard.history[-1]["action"] == "charging disabled • adjust 10→12A"
+        # cleanup
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+
+    def test_enable_sets_global_triggers_poll_and_logs(self, caplog):
+        import chaos
+        from starlette.testclient import TestClient
+
+        chaos._chargingEnabled = False
+        chaos._forcePoll.clear()
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t", "action": ""})
+        with caplog.at_level(logging.INFO, logger="chaos"):
+            with TestClient(_webApp) as client:
+                r = client.post("/api/charging", json={"enabled": True})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "chargingEnabled": True}
+        assert chaos._chargingEnabled is True
+        assert chaos._forcePoll.is_set()
+        assert any("enabled" in m for m in caplog.messages)
+        assert chaos._dashboard.history[-1]["action"] == "charging enabled"
+        # cleanup
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+
+    def test_no_change_skips_log_and_poll(self, caplog):
+        """Posting the current value is a no-op: no log, no poll, no annotation."""
+        import chaos
+        from starlette.testclient import TestClient
+
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t", "action": "hold min"})
+        with caplog.at_level(logging.INFO, logger="chaos"):
+            with TestClient(_webApp) as client:
+                r = client.post("/api/charging", json={"enabled": True})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "chargingEnabled": True}
+        assert not chaos._forcePoll.is_set()
+        assert not any("enabled" in m or "disabled" in m for m in caplog.messages)
+        assert chaos._dashboard.history[-1]["action"] == "hold min"  # unchanged
+
+    def test_no_previous_history_action_is_plain_label(self):
+        """When history entry has no prior action, annotation is just the label."""
+        import chaos
+        from starlette.testclient import TestClient
+
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t"})  # no 'action' key
+        with TestClient(_webApp) as client:
+            r = client.post("/api/charging", json={"enabled": False})
+        assert r.status_code == 200
+        assert chaos._dashboard.history[-1]["action"] == "charging disabled"
+        # cleanup
+        chaos._chargingEnabled = True
+        chaos._forcePoll.clear()
+
+    def test_non_bool_returns_400(self):
+        from starlette.testclient import TestClient
+        with TestClient(_webApp) as client:
+            r = client.post("/api/charging", json={"enabled": "yes"})
+        assert r.status_code == 400
+        from starlette.testclient import TestClient
+        with TestClient(_webApp) as client:
+            r = client.post("/api/charging", json={})
+        assert r.status_code == 400

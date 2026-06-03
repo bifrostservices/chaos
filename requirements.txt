@@ -8,7 +8,7 @@ fastapi==0.135.3
 grpc-stubs==1.53.0.6
 grpcio==1.78.0
 h11==0.16.0
-idna==3.11
+idna>=3.15
 lucidmotors @ git+https://github.com/nshp/python-lucidmotors.git@1f9de955645c78bb343b75ba079bdddfc6f5d458
 markdown-it-py==4.0.0
 mdurl==0.1.2

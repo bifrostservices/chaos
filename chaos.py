@@ -49,7 +49,7 @@ import grpc
 import pygal
 import uvicorn
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,6 +107,7 @@ _CONNECT_TIMEOUT = 15.0       # Seconds before a Powerwall connection attempt ti
 _SOLAR_ZERO_SUSPECT_W = 200   # Minimum rolling avg (W) that makes a 0W solar reading suspect
 _PW_POLL_RETRY_ATTEMPTS = 2   # Retries after a 0W solar transient before giving up
 _PW_POLL_RETRY_DELAY_S = 2.0  # Seconds between retries
+_PW_POLLING_INTERVAL_S = 60   # Powerwall poll cadence (seconds); dark → ×_INTERVAL_DARK
 # After a STOP command, the Lucid API may lag a few cycles before reflecting the stopped state.
 # This window suppresses external-session detection and command re-issue during that lag period.
 # It is intentionally much shorter than commandCooldownMinutes so the EV card is not hidden for
@@ -119,6 +120,7 @@ _STOP_LAG_SECS = 120          # Max seconds of API lag expected after a STOP com
 _AUTO_SWITCH_CYCLES_REQUIRED = 3    # consecutive mismatch cycles before switching
 _AUTO_SWITCH_LOAD_RATIO = 0.5       # fraction of expectedEvPower used as load threshold
 
+_HISTORY_MAXLEN = 120  # number of recent cycles to keep in history (for display and debugging)
 
 async def _lucidCallWithRetry(coro_fn, prefix: str = "") -> Any:
     """Call an async Lucid API function with retry on transient errors."""
@@ -129,7 +131,7 @@ async def _lucidCallWithRetry(coro_fn, prefix: str = "") -> Any:
         except APIError as e:
             if _isTransientLucidError(e) and attempt < _LUCID_RETRY_ATTEMPTS - 1:
                 log.warning(
-                    f"{pfx}Transient Lucid API error ({e}), "
+                    f"[Lucid] {pfx}Transient API error ({e}), "
                     f"retrying in {_LUCID_RETRY_DELAY_SECS}s "
                     f"(attempt {attempt + 1}/{_LUCID_RETRY_ATTEMPTS})..."
                 )
@@ -346,8 +348,9 @@ class DashboardState:
     nextPollAt: datetime | None = None    # when the next backend poll cycle is expected to run
     activePowerwall: str = ""            # name of currently active Powerwall
     powerwallNames: list[str] = field(default_factory=list)  # all configured Powerwall names
-    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=120))
+    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_HISTORY_MAXLEN))
     siteReadings: list = field(default_factory=list)  # per-site Powerwall data for dashboard; see _buildSiteReadings
+    chargingEnabled: bool = True  # user-controlled; False blocks new sessions and stops active ones
 
 
 _dashboard = DashboardState()
@@ -369,6 +372,7 @@ _forcePoll = asyncio.Event()       # /api/poll — trigger an immediate poll cyc
 _switchPowerwall = asyncio.Event() # /api/powerwall — switch the active Powerwall site
 _pendingPowerwallName: str | None = None
 _webApiKey: str = ""  # optional; if non-empty, POST endpoints require X-API-Key header
+_chargingEnabled: bool = True  # user-controlled via POST /api/charging; False blocks and stops charging
 
 
 @dataclass
@@ -378,7 +382,7 @@ class SiteInfo:
     pw: pypowerwall.Powerwall | None  # None if startup connection failed
     pwState: PowerwallState = field(default_factory=PowerwallState)
     error: str | None = None
-    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=120))
+    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_HISTORY_MAXLEN))
 
 
 def _rawSurplusKw(solarWatts: float, homeWatts: float) -> float:
@@ -420,6 +424,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .poll-btn{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:4px 12px;font-size:.8em;cursor:pointer;margin-left:10px;vertical-align:middle}
   .poll-btn:hover{background:#334155;color:#e2e8f0}
   .poll-btn:disabled{opacity:.5;cursor:default}
+  .charging-toggle{display:inline-flex;gap:4px;margin-left:10px;vertical-align:middle}
+  .toggle-btn{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:4px 12px;font-size:.8em;cursor:pointer}
+  .toggle-btn:hover:not(.toggle-active){background:#334155;color:#e2e8f0}
+  .toggle-btn.toggle-enable.toggle-active{background:#14532d;color:#86efac;border-color:#166534;cursor:default}
+  .toggle-btn.toggle-disable.toggle-active{background:#450a0a;color:#fca5a5;border-color:#7f1d1d;cursor:default}
   .chart-section{margin-bottom:24px}
   .chart-section h2{margin-bottom:8px}
   .chart-wrap{background:#1e293b;border-radius:10px;padding:4px;border:1px solid #334155;margin-bottom:10px;max-width:50%}
@@ -434,7 +443,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head><body>
 <div class="title-row">
 <h1>⚡ <abbr title="CHarging Automatically On Solar">CHAOS</abbr></h1>
+<div>
+<div class="charging-toggle">
+  <button class="toggle-btn toggle-enable" id="btnEnable" onclick="setCharging(true)">Enable Charging</button>
+  <button class="toggle-btn toggle-disable" id="btnDisable" onclick="setCharging(false)">Disable Charging</button>
+</div>
 <button class="poll-btn" id="pollBtn" onclick="forcePoll()">Update now</button>
+</div>
 </div>
 <div class="tagline"><span class="hi">CH</span>arging <span class="hi">A</span>utomatically <span class="hi">O</span>n <span class="hi">S</span>olar</div>
 <div class="subtitle" id="sub">Loading…</div>
@@ -499,6 +514,9 @@ function refresh(){
     const imperial=d.units!=='metric';
     const ts=d.lastUpdated?new Date(d.lastUpdated).toLocaleString():'Never';
     if(d.version)document.getElementById('ver').textContent='CHAOS v'+d.version;
+    const enabled=d.chargingEnabled!==false;
+    document.getElementById('btnEnable').classList.toggle('toggle-active',enabled);
+    document.getElementById('btnDisable').classList.toggle('toggle-active',!enabled);
 
     // Live countdown to next poll — update every second
     if(window._countdownTimer)clearInterval(window._countdownTimer);
@@ -591,6 +609,10 @@ function refresh(){
     });
   }).catch(()=>{ setTimeout(refresh,65000); });
 }
+function setCharging(enabled){
+  fetch('/api/charging',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'__CHAOS_API_KEY__'},body:JSON.stringify({enabled:enabled})})
+    .then(()=>{setTimeout(refresh,500);setTimeout(refresh,5000);});
+}
 function forcePoll(){
   const btn=document.getElementById('pollBtn');
   btn.disabled=true;btn.textContent='Polling…';
@@ -604,7 +626,7 @@ function switchPowerwall(name){
 }
 refresh();
 </script>
-<div class="footer" id="ver"></div>
+<div class="footer"><span id="ver"></span> &nbsp;·&nbsp; <a href="/api/log" target="_blank" style="color:#64748b;text-decoration:none;">view log</a></div>
 </body></html>"""
 
 _webApp = fastapi.FastAPI(docs_url=None, redoc_url=None)
@@ -704,6 +726,12 @@ async def _webApiState():
     d["history"] = list(d["history"])
     return d
 
+@_webApp.get("/api/log", response_class=fastapi.responses.Response)
+async def _webApiLog():
+    log_path = pathlib.Path("chaos.log")
+    content = log_path.read_text(errors="replace") if log_path.exists() else "(log file not found)"
+    return fastapi.Response(content=content, media_type="text/plain; charset=utf-8")
+
 @_webApp.get("/pygal-tooltips.min.js", response_class=fastapi.responses.Response)
 async def _webPygalJs():
     js = (pathlib.Path(__file__).parent / "pygal-tooltips.min.js").read_bytes()
@@ -713,6 +741,23 @@ async def _webPygalJs():
 async def _webApiPoll(_: None = fastapi.Depends(_checkApiKey)):
     _forcePoll.set()
     return {"status": "ok"}
+
+@_webApp.post("/api/charging")
+async def _webApiSetCharging(body: dict, _: None = fastapi.Depends(_checkApiKey)):
+    global _chargingEnabled
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise fastapi.HTTPException(status_code=400, detail="'enabled' must be a boolean")
+    if enabled != _chargingEnabled:
+        _chargingEnabled = enabled
+        _dashboard.chargingEnabled = enabled
+        desc = "charging enabled" if enabled else "charging disabled"
+        log.info("Charging %s by user", "enabled" if enabled else "disabled")
+        if _dashboard.history:
+            prev = _dashboard.history[-1].get("action", "")
+            _dashboard.history[-1]["action"] = desc + (" • " + prev if prev else "")
+        _forcePoll.set()  # apply immediately
+    return {"ok": True, "chargingEnabled": _chargingEnabled}
 
 @_webApp.post("/api/powerwall")
 async def _webApiSwitchPowerwall(body: dict, _: None = fastapi.Depends(_checkApiKey)):
@@ -789,9 +834,9 @@ async def sendWebhook(url, payload):
         # doesn't warrant adding an async httpx dependency.
         response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
         if not response.ok:
-            log.warning(f"Webhook returned {response.status_code}: {response.text[:200]}")
+            log.warning(f"[Webhook] Returned {response.status_code}: {response.text[:200]}")
     except Exception as e:
-        log.warning(f"Webhook delivery failed: {e}")
+        log.warning(f"[Webhook] Delivery failed: {e}")
 
 
 def fireWebhook(url, payload):
@@ -842,9 +887,15 @@ def _decideChargingAction(
     effectiveSurplusKw: float,
     evSocPercent: float,
     externalSession: bool = False,  # True when car was found charging without CHAOS having started it
+    chargingEnabled: bool = True,   # False blocks new sessions and stops any active one
 ) -> ChargingDecision:
     """Pure function: given current state, return the charging action to take.
     Contains no I/O — fully unit-testable without mocking Lucid or Powerwall."""
+    if not chargingEnabled:
+        if isCharging:
+            return ChargingDecision(ChargingAction.STOP, 0, "charging disabled by user")
+        return ChargingDecision(ChargingAction.NONE, prevEvChargingAmps, "charging disabled")
+
     if isCharging:
         if externalSession and not thresholds.allowExternalChargeInterference:
             return ChargingDecision(
@@ -906,7 +957,7 @@ async def pollVehicleAndDecide(
 ) -> VehicleState:
     vehicles = await lucid.fetch_vehicles()
     if not vehicles:
-        log.error("No vehicles returned from Lucid API; cannot make charging decision.")
+        log.error("[Lucid] No vehicles returned from API; cannot make charging decision.")
         raise RuntimeError("No vehicles available from Lucid API")
     vehicle = vehicles[0]
     evSocPercent = vehicle.state.battery.charge_percent
@@ -981,6 +1032,7 @@ async def pollVehicleAndDecide(
         thresholds, inCooldown, lastCommandWasStart, cooldownRemainingDesc,
         pwState, effectiveSurplusKw, evSocPercent,
         externalSession=externalSession,
+        chargingEnabled=_chargingEnabled,
     )
 
     def statePayload(event, reason, amps: int):
@@ -1047,14 +1099,14 @@ async def pollVehicleAndDecide(
                 await asyncio.sleep(5)
                 vehicles = await lucid.fetch_vehicles()
                 if not vehicles:
-                    log.warning("fetch_vehicles() returned empty list during wake-up; retrying.")
+                    log.warning("[Lucid] fetch_vehicles() returned empty list during wake-up; retrying.")
                     continue
                 vehicle = vehicles[0]
                 if lucid.vehicle_is_awake(vehicle):
                     log.info("Vehicle is awake.")
                     break
             else:
-                log.warning("Vehicle did not wake within 60s; proceeding anyway.")
+                log.warning("[Lucid] Vehicle did not wake within 60s; proceeding anyway.")
         await lucid.set_charge_limit(vehicle, int(thresholds.targetEvChargePercent))
         await lucid.set_ac_current_limit(vehicle, decision.targetAmps)
         await lucid.start_charging(vehicle)
@@ -1098,6 +1150,7 @@ def _updateDashboard(
     with EV-specific fields and updates the dashboard EV card fields.
     """
     dashState.lastUpdated = datetime.now(timezone.utc)
+    dashState.chargingEnabled = _chargingEnabled
     if cachedState is not None:
         dashState.evSocPercent = round(cachedState.evSocPercent, 1)
         dashState.chargeStateName = _chargeStateName(cachedState.chargeState)
@@ -1194,7 +1247,7 @@ async def processCycle(
         try:
             await lucid.authentication_refresh()
         except APIError as e:
-            log.warning(f"Auth refresh failed ({e}), re-logging in to Lucid...")
+            log.warning(f"[Lucid] Auth refresh failed ({e}), re-logging in...")
             await _lucidLoginWithRetry(lucid, lucidConfig)
 
     # --- Decide whether to poll Lucid ---
@@ -1213,6 +1266,9 @@ async def processCycle(
             pollIntervalFactor = _INTERVAL_PW_LOW
         elif cachedState is not None and cachedState.evSocPercent >= thresholds.targetEvChargePercent:
             skipReason = "EV at target"
+            pollIntervalFactor = _INTERVAL_EV_DONE
+        elif not _chargingEnabled:
+            skipReason = "charging disabled"
             pollIntervalFactor = _INTERVAL_EV_DONE
 
     if skipReason:
@@ -1354,14 +1410,14 @@ async def _pollOneSite(site: SiteInfo) -> bool:
         if (solar or 0) == 0:
             if (home or 0) == 0 and (soc or 0) == 0:
                 site.error = "All-zero reading (transient?)"
-                log.warning(f"[{name}] All-zero reading — skipping update")
+                log.warning(f"[Powerwall:{name}] All-zero reading — skipping update")
                 return False
             if site.pwState.avgSolarWatts > _SOLAR_ZERO_SUSPECT_W:
                 # 0W solar with a healthy rolling average suggests a transient read failure
                 # (e.g. ConnectionResetError inside pypowerwall). Retry before giving up.
                 for attempt in range(_PW_POLL_RETRY_ATTEMPTS):
                     log.warning(
-                        f"[{name}] Solar=0W but rolling avg={site.pwState.avgSolarWatts:.0f}W"
+                        f"[Powerwall:{name}] Solar=0W but rolling avg={site.pwState.avgSolarWatts:.0f}W"
                         f" — retrying ({attempt + 1}/{_PW_POLL_RETRY_ATTEMPTS})"
                     )
                     await asyncio.sleep(_PW_POLL_RETRY_DELAY_S)
@@ -1370,18 +1426,19 @@ async def _pollOneSite(site: SiteInfo) -> bool:
                         break  # retry recovered a valid reading
                 if (solar or 0) == 0:
                     log.warning(
-                        f"[{name}] Solar=0W after {_PW_POLL_RETRY_ATTEMPTS} retries"
+                        f"[Powerwall:{name}] Solar=0W after {_PW_POLL_RETRY_ATTEMPTS} retries"
                         " — 0W solar transient, skipping solar update"
                     )
-                    if (soc or 0) > 0:
-                        site.pwState.updateSoc(float(soc))
+                    soc_f = float(soc) if soc is not None else 0.0
+                    if soc_f > 0.0:
+                        site.pwState.updateSoc(soc_f)
                     return False
         site.pwState.update(float(solar or 0), float(home or 0), float(soc or 0))
         site.error = None
         return True
     except Exception as e:
         site.error = str(e)
-        log.warning(f"[{name}] Poll failed: {e}")
+        log.warning(f"[Powerwall:{name}] Poll failed: {e}")
         return False
 
 
@@ -1437,7 +1494,7 @@ async def runChaos(config):
             pw = await _connectPowerwall(pwConf, name)
             allSites[name] = SiteInfo(name=name, pw=pw)
         except Exception as e:
-            log.warning(f"Failed to connect to Powerwall '{name}' at startup: {e}")
+            log.warning(f"[Powerwall] Failed to connect to '{name}' at startup: {e}")
             allSites[name] = SiteInfo(name=name, pw=None, error=str(e))
 
     if allSites[activeName].pw is None:
@@ -1500,6 +1557,8 @@ async def runChaos(config):
         forcedByUser = False
         forcedEvPollPending = False
         pendingSwitchAnnotation: str | None = None
+        nextEvPollDue: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        evPollFactor: int = 1
 
         async def _doSiteSwitch(newName: str, annotation: str) -> None:
             """Update shared state when switching the active site. Caller logs and does extras."""
@@ -1515,12 +1574,14 @@ async def runChaos(config):
             try:
                 # Poll ALL sites concurrently; every successful site gets a history entry.
                 await _pollAllSites(allSites)
+                now = datetime.now(timezone.utc)
+                evPollDue = now >= nextEvPollDue or forcedByUser or forcedEvPollPending
                 if allSites[activeName].error:
-                    log.warning(f"[{activeName}] Active site PW poll failed — skipping decision cycle")
-                    pollIntervalFactor = 1
-                else:
+                    log.warning(f"[Powerwall:{activeName}] Active site poll failed — skipping decision cycle")
+                elif evPollDue:
                     prevCommandTime = cachedState.lastCommandTime if cachedState else None
-                    cachedState, pollIntervalFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
+                    cachedState, evPollFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
+                    nextEvPollDue = datetime.now(timezone.utc) + timedelta(seconds=pollingIntervalSeconds * evPollFactor)
                     # processCycle succeeded — clear any pending forced EV poll.
                     forcedEvPollPending = False
                     # Annotate the first history entry after a site switch.
@@ -1586,8 +1647,7 @@ async def runChaos(config):
                 return
             except (LoginError, PowerwallConnectionError) as e:
                 # Transient Powerwall auth/connection failure — reconnect silently.
-                pollIntervalFactor = 1
-                log.warning(f"Powerwall connection error: {e} — reconnecting...")
+                log.warning(f"[Powerwall] Connection error: {e} — reconnecting...")
                 _dashboard.lastError = str(e)
                 try:
                     active_pw = allSites[activeName].pw
@@ -1596,9 +1656,8 @@ async def runChaos(config):
                     log.info("Powerwall reconnected.")
                     _dashboard.lastError = None
                 except Exception as reconnectError:
-                    log.warning(f"Powerwall reconnect failed: {reconnectError}")
+                    log.warning(f"[Powerwall] Reconnect failed: {reconnectError}")
             except Exception as e:
-                pollIntervalFactor = 1
                 log.error(f"Poll cycle error: {e}", exc_info=True)
                 _dashboard.lastError = str(e)
                 fireWebhook(
@@ -1612,11 +1671,15 @@ async def runChaos(config):
                 )
 
             try:
-                sleepSeconds = pollingIntervalSeconds * pollIntervalFactor
+                isDark = allSites[activeName].pwState.isDark
+                pwSleep = _PW_POLLING_INTERVAL_S * (_INTERVAL_DARK if isDark else 1)
+                evSleepRemaining = max(0.0, (nextEvPollDue - datetime.now(timezone.utc)).total_seconds())
+                sleepSeconds = min(pwSleep, evSleepRemaining)
                 _dashboard.nextPollAt = datetime.now(timezone.utc) + timedelta(seconds=sleepSeconds)
                 await asyncio.wait_for(_forcePoll.wait(), timeout=sleepSeconds)
                 log.info("Poll cycle triggered by user request.")
                 forcedByUser = True
+                nextEvPollDue = datetime.min.replace(tzinfo=timezone.utc)  # force EV poll on next cycle
             except asyncio.TimeoutError:
                 forcedByUser = False
             finally:
@@ -1640,11 +1703,12 @@ async def runChaos(config):
                             site.pw = await _connectPowerwall(newPwConfig, newName)
                             site.error = None
                         await _doSiteSwitch(newName, "⇄")
+                        forcedEvPollPending = True
                         log.info(f"Active Powerwall switched to '{newName}'.")
                     except Exception as switchErr:
-                        log.warning(f"Failed to switch to Powerwall '{newName}': {switchErr}")
+                        log.warning(f"[Powerwall] Failed to switch to '{newName}': {switchErr}")
                 else:
-                    log.warning(f"Unknown Powerwall name '{newName}' — ignoring switch request")
+                    log.warning(f"[Powerwall] Unknown site name '{newName}' — ignoring switch request")
 
 def main():
     config = loadConfig()
