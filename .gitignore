@@ -4,6 +4,7 @@ chaos.log
 __pycache__/
 .powerwall*
 launch.json
+*.tar
 
 # General
 .DS_Store

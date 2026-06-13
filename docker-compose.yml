@@ -1,8 +1,7 @@
 # CHAOS — CHarging Automatically On Solar
 #
 # Quick start:
-#   1. touch chaos.log          # Docker needs the file to exist before bind-mounting it
-#   2. docker compose up -d
+#   docker compose up -d --build
 #
 # Multi-architecture build (build once, run on both Apple Silicon and Synology amd64):
 #   docker buildx build --platform linux/amd64,linux/arm64 -t chaos:latest --push .
@@ -21,7 +20,7 @@ services:
     environment:
       TZ: America/Chicago
     ports:
-      - "8086:8086"
+      - "8087:8087"
     volumes:
       # config.json contains credentials — mount read-write since can change active Powerwall site
       - ./config.json:/app/config.json

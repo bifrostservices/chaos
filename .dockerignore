@@ -19,8 +19,6 @@ plan-web-ui.md
 chaos_notes.md
 chaos_walkthrough.md
 SampleVehicleInfo.json
-pygal-tooltips.min.js
-
 # Version control
 .git/
 .gitignore

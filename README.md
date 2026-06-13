@@ -11,7 +11,7 @@ CHAOS was motivated by integrating a Lucid Gravity into a previously all-Tesla g
 3. It computes the solar surplus (solar − home), corrected for the EV's own load so it doesn't double-count charging.
 4. A rolling average smooths out transient clouds before any charging decisions are made.
 5. Based on surplus, Powerwall SOC, and EV state of charge, CHAOS issues `start`, `stop`, or `adjust` commands to the Lucid API.
-6. A live web dashboard is served on port 8086 showing all state, charts, and recent history.
+6. A live web dashboard is served on port 8087 showing all state, charts, and recent history.
 
 ## Requirements
 
@@ -24,7 +24,7 @@ CHAOS was motivated by integrating a Lucid Gravity into a previously all-Tesla g
 
 - **`config.json` contains plaintext credentials** — Lucid account and Powerwall gateway passwords are stored in plaintext. The file is gitignored, but you should also restrict its permissions: `chmod 600 config.json`.
 - **Dashboard has no authentication by default** — Set `dashboard.apiKey` in your config if the dashboard is reachable from outside localhost or a fully trusted network. Without a key, anyone on the network can trigger a poll or switch the active Powerwall.
-- **No HTTPS** — The built-in web server has no TLS. CHAOS is designed for a trusted local network. Never expose port 8086 directly to the internet; if remote access is needed, place it behind a VPN or a reverse proxy with TLS termination.
+- **No HTTPS** — The built-in web server has no TLS. CHAOS is designed for a trusted local network. Never expose port 8087 directly to the internet; if remote access is needed, place it behind a VPN or a reverse proxy with TLS termination.
 
 ## Running standalone
 
@@ -44,18 +44,14 @@ $EDITOR config.json
 python chaos.py
 ```
 
-Logs are written to stdout and to `chaos.log` in the working directory. The web dashboard is available at `http://localhost:8086` (or whichever port you set in `dashboard.port`).
+Logs are written to stdout and to `chaos.log` in the working directory. The web dashboard is available at `http://localhost:8087` (or whichever port you set in `dashboard.port`).
 
 ## Running in Docker
 
 ### Quick start
 
 ```bash
-# The log file must exist before Docker mounts it
-touch chaos.log
-
-# Build and start
-docker compose up -d
+docker compose up -d --build
 ```
 
 ### Build options
@@ -69,7 +65,7 @@ docker buildx build --platform linux/arm64 --load .   # Apple Silicon
 docker buildx build --platform linux/amd64,linux/arm64 --push -t yourrepo/chaos:latest .
 ```
 
-The `docker-compose.yml` bind-mounts `config.json` read-only and `chaos.log` for persistence. The container exposes port 8086.
+The `docker-compose.yml` bind-mounts `config.json` read-only and `chaos.log` for persistence. The container exposes port 8087.
 
 ## Configuration reference
 
@@ -185,7 +181,7 @@ Web UI settings.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `port` | number | `8086` | TCP port for the web dashboard. Set to `0` to disable the web server. |
+| `port` | number | `8087` | TCP port for the web dashboard. Set to `0` to disable the web server. |
 | `units` | string | `"imperial"` | Display units. `"imperial"` shows miles; `"metric"` shows kilometres. |
 | `ratedRangeMiles` | number or null | `null` | Rated range of the vehicle in miles, used to display an estimated range alongside SOC. Set to `null` to omit. |
 | `apiKey` | string | `""` | If non-empty, the mutation endpoints (`/api/poll` and `/api/powerwall`) require an `X-API-Key` header matching this value. Read-only endpoints (dashboard state, charts) remain open. Leave empty to disable authentication. |

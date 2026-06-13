@@ -49,7 +49,7 @@ import grpc
 import pygal
 import uvicorn
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,10 +86,11 @@ def _isUnplugged(chargeState: int) -> bool:
 
 
 def _isTransientLucidError(exc: Exception) -> bool:
-    """True for transient gRPC errors (UNAVAILABLE or INTERNAL) that are safe to retry."""
+    """True for transient gRPC errors (UNAVAILABLE, INTERNAL, RESOURCE_EXHAUSTED) that are safe to retry."""
     return isinstance(exc, APIError) and exc.code in (
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
     )
 
 
@@ -101,7 +102,8 @@ _INTERVAL_AFTER_COMMAND = 3   # Let vehicle settle after a start/stop command
 
 # Lucid API retry settings for transient errors
 _LUCID_RETRY_ATTEMPTS = 3
-_LUCID_RETRY_DELAY_SECS = 3
+_LUCID_RETRY_DELAY_SECS = 3        # delay between retries for UNAVAILABLE/INTERNAL
+_LUCID_RATE_LIMIT_DELAY_SECS = 60  # longer backoff for RESOURCE_EXHAUSTED (rate limit)
 _CONNECT_TIMEOUT = 15.0       # Seconds before a Powerwall connection attempt times out
 # Solar=0 with a healthy rolling average signals a transient TEDAPI read error (e.g. timeout)
 _SOLAR_ZERO_SUSPECT_W = 200   # Minimum rolling avg (W) that makes a 0W solar reading suspect
@@ -113,6 +115,7 @@ _PW_POLLING_INTERVAL_S = 60   # Powerwall poll cadence (seconds); dark → ×_IN
 # It is intentionally much shorter than commandCooldownMinutes so the EV card is not hidden for
 # the entire decision cooldown if the vehicle keeps/resumes charging.
 _STOP_LAG_SECS = 120          # Max seconds of API lag expected after a STOP command
+_WEBHOOK_RETRY_DELAY_SECS = 5  # seconds to wait before retrying a webhook on 429
 # Auto site-switch detection: when the EV is confirmed charging but the active site's
 # home load doesn't reflect the expected EV draw, CHAOS suspects the EV is on a different
 # site. Detection requires the mismatch to persist for _AUTO_SWITCH_CYCLES_REQUIRED
@@ -130,12 +133,17 @@ async def _lucidCallWithRetry(coro_fn, prefix: str = "") -> Any:
             return await coro_fn()
         except APIError as e:
             if _isTransientLucidError(e) and attempt < _LUCID_RETRY_ATTEMPTS - 1:
+                delay = (
+                    _LUCID_RATE_LIMIT_DELAY_SECS
+                    if e.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+                    else _LUCID_RETRY_DELAY_SECS
+                )
                 log.warning(
                     f"[Lucid] {pfx}Transient API error ({e}), "
-                    f"retrying in {_LUCID_RETRY_DELAY_SECS}s "
+                    f"retrying in {delay}s "
                     f"(attempt {attempt + 1}/{_LUCID_RETRY_ATTEMPTS})..."
                 )
-                await asyncio.sleep(_LUCID_RETRY_DELAY_SECS)
+                await asyncio.sleep(delay)
             else:
                 raise
 
@@ -833,6 +841,9 @@ async def sendWebhook(url, payload):
         # requests is used intentionally here — a single fire-and-forget POST
         # doesn't warrant adding an async httpx dependency.
         response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
+        if response.status_code == 429:
+            await asyncio.sleep(_WEBHOOK_RETRY_DELAY_SECS)
+            response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
         if not response.ok:
             log.warning(f"[Webhook] Returned {response.status_code}: {response.text[:200]}")
     except Exception as e:
@@ -1331,14 +1342,12 @@ async def _connectPowerwall(pwConfig: dict, name: str) -> pypowerwall.Powerwall:
 
 
 def _writePowerwallToConfig(newName: str, path: str = "config.json") -> None:
-    """Atomically update activePowerwall in config.json."""
+    """Update activePowerwall in config.json."""
     try:
         p = pathlib.Path(path)
         data = json.loads(p.read_text())
         data["activePowerwall"] = newName
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(p)
+        p.write_text(json.dumps(data, indent=2))
         log.info(f"Updated config.json: activePowerwall = '{newName}'")
     except Exception as e:
         log.warning(f"Failed to write activePowerwall to config: {e}")
@@ -1546,7 +1555,7 @@ async def runChaos(config):
         _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
 
         # Start web UI
-        webUiPort = dashboard_cfg.get("port", 8086)
+        webUiPort = dashboard_cfg.get("port", 8087)
         global _webApiKey
         _webApiKey = dashboard_cfg.get("apiKey", "")
         if webUiPort:

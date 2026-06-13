@@ -13,11 +13,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY chaos.py .
+COPY pygal-tooltips.min.js .
 
 # config.json is bind-mounted at runtime — never bake credentials into the image.
 # chaos.log is bind-mounted at runtime so logs are accessible on the host.
 
-EXPOSE 8086
+EXPOSE 8087
 
-# Run as PID 1 so SIGTERM (docker stop) reaches the process and triggers clean shutdown.
-CMD ["python", "chaos.py"]
+# `touch` ensures chaos.log exists as a file before Python opens it as a FileHandler.
+# On Linux, bind-mounting a file that doesn't exist on the host causes Docker to create
+# a directory there instead — which makes Python's FileHandler crash with IsADirectoryError.
+# `exec` replaces sh with Python so the process remains PID 1 and receives SIGTERM cleanly.
+CMD ["sh", "-c", "touch /app/chaos.log && exec python chaos.py"]

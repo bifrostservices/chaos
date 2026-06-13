@@ -55,6 +55,7 @@ from chaos import (
     _isTransientLucidError,
     _isUnplugged,
     _lucidLoginWithRetry,
+    _LUCID_RATE_LIMIT_DELAY_SECS,
     _pollAllSites,
     _pollOneSite,
     _shouldForceEarlyEvPoll,
@@ -561,6 +562,28 @@ class TestSendWebhook:
             await sendWebhook(url, payload)
             _, kwargs = mock_post.call_args
             assert kwargs["json"] == {"text": "hello"}  # stripped to text-only
+
+    async def test_retries_once_on_429(self):
+        """429 response triggers one retry after _WEBHOOK_RETRY_DELAY_SECS; succeeds on second attempt."""
+        rate_limited = MagicMock(ok=False, status_code=429, text="Too Many Requests")
+        success = MagicMock(ok=True, status_code=200)
+        with patch("chaos.requests.post", side_effect=[rate_limited, success]) as mock_post, \
+             patch("chaos.asyncio.sleep", new=AsyncMock()) as mock_sleep, \
+             patch("chaos.log") as mock_log:
+            await sendWebhook("https://example.com/hook", {"event": "test"})
+        assert mock_post.call_count == 2
+        mock_sleep.assert_awaited_once()
+        mock_log.warning.assert_not_called()
+
+    async def test_logs_warning_when_retry_also_fails(self):
+        """429 followed by another non-2xx on retry → logs a warning."""
+        rate_limited = MagicMock(ok=False, status_code=429, text="Too Many Requests")
+        still_bad = MagicMock(ok=False, status_code=503, text="Service Unavailable")
+        with patch("chaos.requests.post", side_effect=[rate_limited, still_bad]), \
+             patch("chaos.asyncio.sleep", new=AsyncMock()), \
+             patch("chaos.log") as mock_log:
+            await sendWebhook("https://example.com/hook", {"event": "test"})
+        mock_log.warning.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1424,10 @@ def _make_internal_error():
     return APIError(grpc.StatusCode.INTERNAL, "Login call failed.", "")
 
 
+def _make_resource_exhausted_error():
+    return APIError(grpc.StatusCode.RESOURCE_EXHAUSTED, "Quota exceeded.", "")
+
+
 def _make_unauthenticated_error():
     return APIError(grpc.StatusCode.UNAUTHENTICATED, "invalid token", "")
 
@@ -1411,6 +1438,9 @@ class TestIsTransientLucidError:
 
     def test_true_for_internal(self):
         assert _isTransientLucidError(_make_internal_error())
+
+    def test_true_for_resource_exhausted(self):
+        assert _isTransientLucidError(_make_resource_exhausted_error())
 
     def test_false_for_other_apierror(self):
         assert not _isTransientLucidError(_make_unauthenticated_error())
@@ -1460,6 +1490,16 @@ class TestLucidLoginWithRetry:
             await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
         assert lucid.login.await_count == 1
 
+    async def test_retries_on_resource_exhausted_with_rate_limit_delay(self):
+        """RESOURCE_EXHAUSTED uses _LUCID_RATE_LIMIT_DELAY_SECS for backoff, not the short delay."""
+        lucid = MagicMock()
+        lucid.login = AsyncMock(side_effect=[_make_resource_exhausted_error(), None])
+        mock_sleep = AsyncMock()
+        with patch("chaos.asyncio.sleep", mock_sleep):
+            await _lucidLoginWithRetry(lucid, {"username": "u", "password": "p"})
+        assert lucid.login.await_count == 2
+        mock_sleep.assert_awaited_once_with(_LUCID_RATE_LIMIT_DELAY_SECS)
+
 
 @pytest.mark.asyncio
 class TestProcessCycleTransientRetry:
@@ -1494,6 +1534,19 @@ class TestProcessCycleTransientRetry:
              pytest.raises(APIError):
             await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, None, forceEvPoll=True, pwState=pw_good)
         assert pvad.await_count == 3
+
+    async def test_resource_exhausted_retries_with_long_delay(self, thresholds, pw_good):
+        """RESOURCE_EXHAUSTED triggers retry using _LUCID_RATE_LIMIT_DELAY_SECS backoff."""
+        returned = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
+        pvad = AsyncMock(side_effect=[_make_resource_exhausted_error(), returned])
+        lucid = _make_lucid_processCycle_mock()
+        mock_sleep = AsyncMock()
+        with patch("chaos.pollVehicleAndDecide", pvad), \
+             patch("chaos.asyncio.sleep", mock_sleep):
+            state, _ = await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, None, forceEvPoll=True, pwState=pw_good)
+        assert pvad.await_count == 2
+        assert state == returned
+        mock_sleep.assert_awaited_once_with(_LUCID_RATE_LIMIT_DELAY_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2033,7 +2086,7 @@ class TestHTMLTemplate:
 # ---------------------------------------------------------------------------
 
 class TestWritePowerwallToConfig:
-    """Tests for the atomic config.json activePowerwall update helper."""
+    """Tests for the config.json activePowerwall update helper."""
 
     def test_writes_active_powerwall(self, tmp_path):
         """Updates activePowerwall in the config file on disk."""
@@ -2063,6 +2116,15 @@ class TestWritePowerwallToConfig:
         """If config.json does not exist, logs a warning and does not raise."""
         _writePowerwallToConfig("Any", path=str(tmp_path / "nonexistent.json"))
         # no exception
+
+    def test_no_rename_over_bind_mount(self, tmp_path):
+        """Does not use Path.replace() — avoids EBUSY on Docker bind mounts on Linux/Synology."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"activePowerwall": "Home"}))
+        with patch("pathlib.Path.replace") as mock_replace:
+            _writePowerwallToConfig("Garage", path=str(cfg_file))
+            mock_replace.assert_not_called()
+        assert json.loads(cfg_file.read_text())["activePowerwall"] == "Garage"
 
 
 # ---------------------------------------------------------------------------
