@@ -49,7 +49,7 @@ import grpc
 import pygal
 import uvicorn
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +124,8 @@ _AUTO_SWITCH_CYCLES_REQUIRED = 3    # consecutive mismatch cycles before switchi
 _AUTO_SWITCH_LOAD_RATIO = 0.5       # fraction of expectedEvPower used as load threshold
 
 _HISTORY_MAXLEN = 120  # number of recent cycles to keep in history (for display and debugging)
+_LONG_HISTORY_INTERVAL_SECS = 300  # record one long-history entry per 5 minutes
+_LONG_HISTORY_MAXLEN = 288         # 24 hours at 5-minute resolution
 
 async def _lucidCallWithRetry(coro_fn, prefix: str = "") -> Any:
     """Call an async Lucid API function with retry on transient errors."""
@@ -318,6 +320,7 @@ class ChargingThresholds:
     minChargingAmps: int              # minimum amps to sustain; below this, stop charging
     maxChargingAmps: int              # cap imposed by EVSE or vehicle onboard charger
     commandCooldownMinutes: float     # after a start/stop command, hold for this many minutes before stopping (protects HV contacts)
+    stopConfirmCycles: int = 4        # consecutive low-surplus cycles required before issuing STOP (1 = stop on first low cycle)
     allowExternalChargeInterference: bool = True  # if True, take over externally-started sessions; if False, observe only
 
     @property
@@ -334,6 +337,7 @@ class VehicleState:
     lastCommandTime: datetime | None = None   # when the last start/stop was issued
     lastCommandWasStart: bool = False         # True if last command was start; False if stop
     lastActionDesc: str = ""                  # human-readable description of last decision for dashboard
+    lowSurplusCycles: int = 0                 # consecutive cycles where surplus was too low while charging (stop-confirm guard)
 
 
 @dataclass
@@ -391,6 +395,8 @@ class SiteInfo:
     pwState: PowerwallState = field(default_factory=PowerwallState)
     error: str | None = None
     history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_HISTORY_MAXLEN))
+    longHistory: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_LONG_HISTORY_MAXLEN))
+    lastLongHistoryTime: datetime | None = None
 
 
 def _rawSurplusKw(solarWatts: float, homeWatts: float) -> float:
@@ -473,6 +479,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 <h2>History</h2>
 <div class="chart-section">
+  <div class="chart-wrap" id="chartPowerHour"></div>
   <div class="chart-wrap" id="chartPower"></div>
   <div class="chart-wrap" id="chartSoc"></div>
 </div>
@@ -595,6 +602,7 @@ function refresh(){
     else eb.style.display='none';
     function _injectSvg(id,s){const el=document.getElementById(id);el.innerHTML='';el.appendChild(document.createRange().createContextualFragment(s));}
     const t=Date.now();
+    fetch('/api/charts/power-hour.svg?t='+t).then(r=>r.text()).then(s=>_injectSvg('chartPowerHour',s));
     fetch('/api/charts/power.svg?t='+t).then(r=>r.text()).then(s=>_injectSvg('chartPower',s));
     fetch('/api/charts/soc.svg?t='+t).then(r=>r.text()).then(s=>_injectSvg('chartSoc',s));
     const tb=document.getElementById('hist');
@@ -711,9 +719,18 @@ def _chartActiveHistory() -> "tuple[list, list] | None":
     labels = [datetime.fromisoformat(h["timestamp"]).astimezone().strftime("%H:%M") for h in hist]
     return hist, labels
 
-def _paddedSiteHistory(site: "SiteInfo", n: int) -> list:
-    """Return the site's history padded with None on the left to length n."""
-    hist = list(site.history)[-n:]
+def _chartLongHistory() -> "tuple[list, list] | None":
+    """Return (history_list, labels) for the active site's long history, or None if fewer than 2 points."""
+    active = _dashboard.activePowerwall
+    hist = list(_allSites[active].longHistory) if active in _allSites else []
+    if len(hist) < 2:
+        return None
+    labels = [datetime.fromisoformat(h["timestamp"]).astimezone().strftime("%H:%M") for h in hist]
+    return hist, labels
+
+def _paddedSiteHistory(hist_deque: "collections.deque", n: int) -> list:
+    """Return the history deque padded with None on the left to length n."""
+    hist = list(hist_deque)[-n:]
     return [None] * (n - len(hist)) + hist
 
 @_webApp.get("/", response_class=fastapi.responses.HTMLResponse)
@@ -734,10 +751,15 @@ async def _webApiState():
     d["history"] = list(d["history"])
     return d
 
+_LOG_TAIL_LINES = 2000  # max lines served by /api/log to bound memory use on large log files
+
 @_webApp.get("/api/log", response_class=fastapi.responses.Response)
 async def _webApiLog():
     log_path = pathlib.Path("chaos.log")
-    content = log_path.read_text(errors="replace") if log_path.exists() else "(log file not found)"
+    if not log_path.exists():
+        return fastapi.Response(content="(log file not found)", media_type="text/plain; charset=utf-8")
+    lines = log_path.read_text(errors="replace").splitlines()
+    content = "\n".join(lines[-_LOG_TAIL_LINES:])
     return fastapi.Response(content=content, media_type="text/plain; charset=utf-8")
 
 @_webApp.get("/pygal-tooltips.min.js", response_class=fastapi.responses.Response)
@@ -782,7 +804,7 @@ async def _webApiSwitchPowerwall(body: dict, _: None = fastapi.Depends(_checkApi
 
 @_webApp.get("/api/charts/power.svg")
 async def _webChartPower():
-    result = _chartActiveHistory()
+    result = _chartLongHistory()
     if result is None:
         return fastapi.Response(content=_CHART_NO_DATA, media_type="image/svg+xml")
     active_hist, labels = result
@@ -794,15 +816,42 @@ async def _webChartPower():
         ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
-        pad = _paddedSiteHistory(site, n)
+        pad = _paddedSiteHistory(site.longHistory, n)
         datasets.append((f"{_DASHED_PREFIX}{siteName} Solar",     [round(h["solarWatts"] / 1000, 2) if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_SOLAR_COLOR}))
         datasets.append((f"{_DASHED_PREFIX}{siteName} Home Load", [round(h["homeWatts"]  / 1000, 2) if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_HOME_COLOR}))
-    svg = _buildChartSvg(pygal.Line, "Power", "kW", datasets, labels)
+    svg = _buildChartSvg(pygal.Line, "Power (24h)", "kW", datasets, labels)
+    return fastapi.Response(content=svg, media_type="image/svg+xml")
+
+@_webApp.get("/api/charts/power-hour.svg")
+async def _webChartPowerHour():
+    result = _chartActiveHistory()
+    if result is None:
+        return fastapi.Response(content=_CHART_NO_DATA, media_type="image/svg+xml")
+    all_hist, all_labels = result
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    pairs = [(h, l) for h, l in zip(all_hist, all_labels)
+             if datetime.fromisoformat(h["timestamp"]) >= cutoff]
+    if len(pairs) < 2:
+        return fastapi.Response(content=_CHART_NO_DATA, media_type="image/svg+xml")
+    active_hist, labels = zip(*pairs)
+    active_hist, labels = list(active_hist), list(labels)
+    active = _dashboard.activePowerwall
+    n = len(active_hist)
+    datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
+        ("Solar",       [round(h["solarWatts"] / 1000, 2) for h in active_hist]),
+        ("Home Load",   [round(max(0.0, h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
+        ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
+    ]
+    for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
+        pad = _paddedSiteHistory(site.history, n)
+        datasets.append((f"{_DASHED_PREFIX}{siteName} Solar",     [round(h["solarWatts"] / 1000, 2) if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_SOLAR_COLOR}))
+        datasets.append((f"{_DASHED_PREFIX}{siteName} Home Load", [round(h["homeWatts"]  / 1000, 2) if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_HOME_COLOR}))
+    svg = _buildChartSvg(pygal.Line, "Power (Last Hour)", "kW", datasets, labels)
     return fastapi.Response(content=svg, media_type="image/svg+xml")
 
 @_webApp.get("/api/charts/soc.svg")
 async def _webChartSoc():
-    result = _chartActiveHistory()
+    result = _chartLongHistory()
     if result is None:
         return fastapi.Response(content=_CHART_NO_DATA, media_type="image/svg+xml")
     active_hist, labels = result
@@ -813,10 +862,10 @@ async def _webChartSoc():
         ("EV Battery", [h.get("evSocPercent") for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
-        pad = _paddedSiteHistory(site, n)
+        pad = _paddedSiteHistory(site.longHistory, n)
         datasets.append((f"{_DASHED_PREFIX}{siteName} PW", [h["powerwallSocPercent"] if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_PW_COLOR}))
     svg = _buildChartSvg(
-        pygal.Line, "State of Charge", "%",
+        pygal.Line, "State of Charge (24h)", "%",
         datasets,
         labels,
         y_range=(0, 100),
@@ -862,6 +911,7 @@ class ChargingAction(Enum):
     STOP = auto()        # stop charging
     ADJUST = auto()      # update current limit to targetAmps
     HOLD_MIN = auto()    # surplus low but in cooldown after start — hold at minChargingAmps
+    HOLD_STOP = auto()   # surplus low but confirming before stop — counting consecutive cycles
     SKIP_START = auto()  # surplus ok but in cooldown after stop — defer start
     OBSERVE = auto()     # externally-started charge; allowExternalChargeInterference=False
 
@@ -882,6 +932,7 @@ _ACTION_DESC: dict[ChargingAction, str] = {
     ChargingAction.HOLD_MIN:   "hold min",
     ChargingAction.SKIP_START: "skip start",
     ChargingAction.OBSERVE:    "observing",
+    # ADJUST and HOLD_STOP use decision.reason directly for per-cycle detail messages
 }
 
 
@@ -899,6 +950,7 @@ def _decideChargingAction(
     evSocPercent: float,
     externalSession: bool = False,  # True when car was found charging without CHAOS having started it
     chargingEnabled: bool = True,   # False blocks new sessions and stops any active one
+    lowSurplusCycles: int = 0,      # consecutive cycles of insufficient surplus while charging (stop-confirm guard)
 ) -> ChargingDecision:
     """Pure function: given current state, return the charging action to take.
     Contains no I/O — fully unit-testable without mocking Lucid or Powerwall."""
@@ -920,6 +972,12 @@ def _decideChargingAction(
                     ChargingAction.HOLD_MIN,
                     thresholds.minChargingAmps,
                     f"surplus low ({effectiveSurplusKw:+.2f}kW → {targetAmps}A) within cooldown ({cooldownRemainingDesc} remaining)",
+                )
+            if lowSurplusCycles < thresholds.stopConfirmCycles - 1:
+                return ChargingDecision(
+                    ChargingAction.HOLD_STOP,
+                    thresholds.minChargingAmps,
+                    f"surplus low ({effectiveSurplusKw:+.2f}kW → {targetAmps}A) confirming stop ({lowSurplusCycles + 1}/{thresholds.stopConfirmCycles} cycles)",
                 )
             return ChargingDecision(
                 ChargingAction.STOP,
@@ -980,6 +1038,7 @@ async def pollVehicleAndDecide(
     prevEvChargingAmps: int = prevState.evChargingAmps if prevState else 0
     lastCommandTime: datetime | None = prevState.lastCommandTime if prevState else None
     lastCommandWasStart: bool = prevState.lastCommandWasStart if prevState else False
+    prevLowSurplusCycles: int = prevState.lowSurplusCycles if prevState else 0
 
     now = datetime.now(timezone.utc)
     _dashboard.vehicleLastPolled = now
@@ -1044,7 +1103,11 @@ async def pollVehicleAndDecide(
         pwState, effectiveSurplusKw, evSocPercent,
         externalSession=externalSession,
         chargingEnabled=_chargingEnabled,
+        lowSurplusCycles=prevLowSurplusCycles,
     )
+
+    # Advance the stop-confirm counter: increment on HOLD_STOP, reset on everything else.
+    newLowSurplusCycles = prevLowSurplusCycles + 1 if decision.action == ChargingAction.HOLD_STOP else 0
 
     def statePayload(event, reason, amps: int):
         emoji = "⚡" if "started" in event else ("🛑" if "stopped" in event else "⚙️")
@@ -1081,6 +1144,12 @@ async def pollVehicleAndDecide(
         fireWebhook(webhookUrl, statePayload("charging_stopped", decision.reason, 0))
 
     elif decision.action == ChargingAction.HOLD_MIN:
+        log.info(f"Holding at minimum — {decision.reason}")
+        if prevEvChargingAmps != thresholds.minChargingAmps:
+            await lucid.set_ac_current_limit(vehicle, thresholds.minChargingAmps)
+            evChargingAmps = thresholds.minChargingAmps
+
+    elif decision.action == ChargingAction.HOLD_STOP:
         log.info(f"Holding at minimum — {decision.reason}")
         if prevEvChargingAmps != thresholds.minChargingAmps:
             await lucid.set_ac_current_limit(vehicle, thresholds.minChargingAmps)
@@ -1136,8 +1205,10 @@ async def pollVehicleAndDecide(
             pwState.resetHomeHistory()   # home load dropped; stale readings now skew avg
         evChargingAmps = 0
 
-    actionDesc = decision.reason if decision.action == ChargingAction.ADJUST else _ACTION_DESC.get(decision.action, "")
-    return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart, lastActionDesc=actionDesc)
+    actionDesc = decision.reason if decision.action in (ChargingAction.ADJUST, ChargingAction.HOLD_STOP) else _ACTION_DESC.get(decision.action, "")
+    if externalSession:
+        actionDesc = f"ext session — {action_desc}"
+    return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart, lastActionDesc=actionDesc, lowSurplusCycles=newLowSurplusCycles)
 
 
 def _chargeStateName(chargeState) -> str:
@@ -1341,6 +1412,33 @@ async def _connectPowerwall(pwConfig: dict, name: str) -> pypowerwall.Powerwall:
     return pw
 
 
+def _longHistoryPath(siteName: str) -> pathlib.Path:
+    return pathlib.Path(f"long_history_{siteName}.json")
+
+
+def _saveLongHistory(site: "SiteInfo") -> None:
+    try:
+        _longHistoryPath(site.name).write_text(json.dumps(list(site.longHistory)))
+    except Exception as e:
+        log.warning(f"[{site.name}] Failed to save long history: {e}")
+
+
+def _loadLongHistory(site: "SiteInfo") -> None:
+    path = _longHistoryPath(site.name)
+    if not path.exists():
+        return
+    try:
+        entries = json.loads(path.read_text())
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_LONG_HISTORY_MAXLEN * _LONG_HISTORY_INTERVAL_SECS)).isoformat()
+        fresh = [e for e in entries if isinstance(e, dict) and e.get("timestamp", "") >= cutoff]
+        site.longHistory.extend(fresh)
+        if fresh:
+            site.lastLongHistoryTime = datetime.fromisoformat(fresh[-1]["timestamp"])
+        log.info(f"[{site.name}] Restored {len(fresh)} long history entries from {path.name}")
+    except Exception as e:
+        log.warning(f"[{site.name}] Failed to load long history: {e}")
+
+
 def _writePowerwallToConfig(newName: str, path: str = "config.json") -> None:
     """Update activePowerwall in config.json."""
     try:
@@ -1460,13 +1558,19 @@ async def _pollAllSites(allSites: dict) -> None:
     for site in allSites.values():
         if site.error is None:
             pw = site.pwState
-            site.history.append({
+            entry = {
                 "timestamp": now_iso,
                 "solarWatts": round(pw.solarWatts),
                 "homeWatts": round(pw.homeWatts),
                 "surplusKw": _rawSurplusKw(pw.solarWatts, pw.homeWatts),
                 "powerwallSocPercent": round(pw.powerwallSocPercent, 1),
-            })
+            }
+            site.history.append(entry)
+            now_dt = datetime.now(timezone.utc)
+            if site.lastLongHistoryTime is None or (now_dt - site.lastLongHistoryTime).total_seconds() >= _LONG_HISTORY_INTERVAL_SECS:
+                site.longHistory.append(entry)
+                site.lastLongHistoryTime = now_dt
+                _saveLongHistory(site)
 
 
 async def runChaos(config):
@@ -1492,6 +1596,7 @@ async def runChaos(config):
         minChargingAmps=chargingConfig["minChargingAmps"],
         maxChargingAmps=chargingConfig["maxChargingAmps"],
         commandCooldownMinutes=chargingConfig["commandCooldownMinutes"],
+        stopConfirmCycles=chargingConfig.get("stopConfirmCycles", 4),
         allowExternalChargeInterference=chargingConfig.get("allowExternalChargeInterference", True),
     )
 
@@ -1505,6 +1610,7 @@ async def runChaos(config):
         except Exception as e:
             log.warning(f"[Powerwall] Failed to connect to '{name}' at startup: {e}")
             allSites[name] = SiteInfo(name=name, pw=None, error=str(e))
+        _loadLongHistory(allSites[name])
 
     if allSites[activeName].pw is None:
         raise RuntimeError(f"Failed to connect to active Powerwall '{activeName}'")
@@ -1560,7 +1666,7 @@ async def runChaos(config):
         _webApiKey = dashboard_cfg.get("apiKey", "")
         if webUiPort:
             server = uvicorn.Server(uvicorn.Config(_webApp, host="0.0.0.0", port=webUiPort, log_level="warning"))
-            asyncio.create_task(server.serve())
+            _serverTask = asyncio.create_task(server.serve())
             log.info(f"Web UI available at http://0.0.0.0:{webUiPort}")
 
         forcedByUser = False

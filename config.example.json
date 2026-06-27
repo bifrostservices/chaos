@@ -21,6 +21,7 @@
     "minChargingAmps": 12,
     "maxChargingAmps": 32,
     "commandCooldownMinutes": 10,
+    "stopConfirmCycles": 4,
     "allowExternalChargeInterference": true
   },
   "pollingIntervalSeconds": 60,

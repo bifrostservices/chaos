@@ -62,6 +62,11 @@ from chaos import (
     _webApp,
     _validateConfig,
     _updateDashboard,
+    _longHistoryPath,
+    _saveLongHistory,
+    _loadLongHistory,
+    _LONG_HISTORY_MAXLEN,
+    _LONG_HISTORY_INTERVAL_SECS,
     _writePowerwallToConfig,
     fireWebhook,
     loadConfig,
@@ -98,11 +103,13 @@ def _make_valid_config(**overrides):
             "minChargingAmps": 6,
             "maxChargingAmps": 48,
             "commandCooldownMinutes": 5,
+            "stopConfirmCycles": 4,
         },
         "pollingIntervalSeconds": 60,
     }
     cfg.update(overrides)
     return cfg
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -293,6 +300,7 @@ def _decide(
     effectiveSurplusKw=2.4,
     evSocPercent=50.0,
     chargingEnabled=True,
+    lowSurplusCycles=0,
 ):
     return _decideChargingAction(
         isCharging=isCharging,
@@ -307,6 +315,7 @@ def _decide(
         effectiveSurplusKw=effectiveSurplusKw,
         evSocPercent=evSocPercent,
         chargingEnabled=chargingEnabled,
+        lowSurplusCycles=lowSurplusCycles,
     )
 
 
@@ -328,7 +337,7 @@ class TestDecideWhenCharging:
         assert d.targetAmps == thresholds.minChargingAmps
 
     def test_hold_min_not_triggered_when_cooldown_after_stop(self, thresholds, pw_good):
-        """Cooldown after a stop should not prevent stopping again."""
+        """Cooldown after a stop should not prevent stopping again once confirm cycles reached."""
         d = _decide(
             thresholds, pw_good,
             isCharging=True,
@@ -336,6 +345,7 @@ class TestDecideWhenCharging:
             prevEvChargingAmps=thresholds.minChargingAmps + 4,
             inCooldown=True,
             lastCommandWasStart=False,  # last command was a stop
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,
         )
         assert d.action == ChargingAction.STOP
 
@@ -346,6 +356,7 @@ class TestDecideWhenCharging:
             targetAmps=thresholds.minChargingAmps - 1,
             inCooldown=False,
             lastCommandWasStart=True,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,
         )
         assert d.action == ChargingAction.STOP
 
@@ -356,6 +367,7 @@ class TestDecideWhenCharging:
             targetAmps=thresholds.minChargingAmps - 1,
             inCooldown=False,
             lastCommandWasStart=False,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,
         )
         assert d.action == ChargingAction.STOP
 
@@ -404,6 +416,100 @@ class TestDecideWhenCharging:
             prevEvChargingAmps=10,
         )
         assert d.action == ChargingAction.NONE
+
+
+# ---------------------------------------------------------------------------
+# _decideChargingAction — stop confirm guard (HOLD_STOP)
+# ---------------------------------------------------------------------------
+
+class TestStopConfirmGuard:
+    """Tests for the consecutive-low-surplus stop confirmation guard."""
+
+    def test_hold_stop_on_first_low_surplus_cycle(self, thresholds, pw_good):
+        """First cycle of low surplus → HOLD_STOP at minChargingAmps, not STOP."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            inCooldown=False,
+            lowSurplusCycles=0,
+        )
+        assert d.action == ChargingAction.HOLD_STOP
+        assert d.targetAmps == thresholds.minChargingAmps
+
+    def test_stop_fires_after_confirm_cycles(self, thresholds, pw_good):
+        """After stopConfirmCycles consecutive low cycles, STOP is issued."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            inCooldown=False,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,
+        )
+        assert d.action == ChargingAction.STOP
+
+    def test_stop_fires_immediately_when_confirm_cycles_is_1(self, pw_good):
+        """stopConfirmCycles=1 restores the original single-cycle stop behaviour."""
+        t = _make_thresholds(stopConfirmCycles=1)
+        d = _decide(
+            t, pw_good,
+            isCharging=True,
+            targetAmps=t.minChargingAmps - 1,
+            inCooldown=False,
+            lowSurplusCycles=0,
+        )
+        assert d.action == ChargingAction.STOP
+
+    def test_hold_stop_reason_includes_cycle_count(self, thresholds, pw_good):
+        """HOLD_STOP reason string includes N/M cycle count."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            inCooldown=False,
+            lowSurplusCycles=1,
+        )
+        assert d.action == ChargingAction.HOLD_STOP
+        assert "2/" in d.reason
+        assert str(thresholds.stopConfirmCycles) in d.reason
+
+    def test_hold_min_not_affected_by_stop_confirm_guard(self, thresholds, pw_good):
+        """During start cooldown, surplus low → HOLD_MIN regardless of lowSurplusCycles."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            inCooldown=True,
+            lastCommandWasStart=True,
+            lowSurplusCycles=0,
+        )
+        assert d.action == ChargingAction.HOLD_MIN
+
+    def test_guard_does_not_apply_to_ev_at_target(self, thresholds, pw_good):
+        """EV at target SOC → STOP immediately, no guard applied."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps + 4,
+            evSocPercent=thresholds.targetEvChargePercent,
+            lowSurplusCycles=0,
+        )
+        assert d.action == ChargingAction.STOP
+
+    def test_guard_does_not_apply_to_low_pw_soc(self, thresholds):
+        """Powerwall below minimum → STOP immediately, no guard applied."""
+        pw_low = PowerwallState(
+            solarWatts=5000,
+            homeWatts=2000,
+            powerwallSocPercent=thresholds.minPowerwallSocPercent - 1,
+        )
+        d = _decide(
+            thresholds, pw_low,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps + 4,
+            lowSurplusCycles=0,
+        )
+        assert d.action == ChargingAction.STOP
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +705,7 @@ def _make_thresholds(**overrides):
         minChargingAmps=8,
         maxChargingAmps=32,
         commandCooldownMinutes=10,
-        allowExternalChargeInterference=True,
+        stopConfirmCycles=4,
     )
     defaults.update(overrides)
     return ChargingThresholds(**defaults)
@@ -817,7 +923,12 @@ class TestPollVehicleAndDecide:
         # Seed home history with high (EV-inclusive) readings
         low_pw.update(100, 7500, 80)
         low_pw.update(100, 7500, 80)
-        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=16)
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=16,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,  # already confirmed enough cycles
+        )
         lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
         await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
         lucid.stop_charging.assert_awaited_once()
@@ -873,7 +984,12 @@ class TestPollVehicleAndDecideActionDesc:
     async def test_stop_sets_action_desc(self, thresholds):
         """When charging is stopped (insufficient surplus), lastActionDesc should be 'stop'."""
         low_pw = PowerwallState(solarWatts=100, homeWatts=3000, powerwallSocPercent=80)
-        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=16)
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=16,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,  # already confirmed enough cycles
+        )
         lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
         result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
         assert result.lastActionDesc == "stop"
@@ -897,6 +1013,91 @@ class TestPollVehicleAndDecideActionDesc:
         lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
         result = await pollVehicleAndDecide(lucid, pw, thresholds, "", prevState=prev)
         assert result.lastActionDesc == ""
+
+
+# ---------------------------------------------------------------------------
+# pollVehicleAndDecide — stop-confirm counter state management
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestStopConfirmCounterIntegration:
+    """Tests for lowSurplusCycles counter management in pollVehicleAndDecide."""
+
+    def _low_surplus_pw(self):
+        """Powerwall with very low solar — will trigger surplus-too-low path."""
+        return PowerwallState(solarWatts=100, homeWatts=3000, powerwallSocPercent=80)
+
+    async def test_counter_increments_on_hold_stop(self, thresholds):
+        """First low-surplus cycle → HOLD_STOP; throttles to minChargingAmps; counter = 1."""
+        low_pw = self._low_surplus_pw()
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=16,
+            lowSurplusCycles=0,
+        )
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        lucid.stop_charging.assert_not_awaited()
+        lucid.set_ac_current_limit.assert_awaited_once_with(vehicle, thresholds.minChargingAmps)
+        assert result.evChargingAmps == thresholds.minChargingAmps
+        assert result.lowSurplusCycles == 1
+
+    async def test_hold_stop_no_api_call_when_already_at_min(self, thresholds):
+        """HOLD_STOP when already at minChargingAmps → no redundant set_ac_current_limit call."""
+        low_pw = self._low_surplus_pw()
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=thresholds.minChargingAmps,
+            lowSurplusCycles=0,
+        )
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        lucid.stop_charging.assert_not_awaited()
+        lucid.set_ac_current_limit.assert_not_awaited()
+        assert result.evChargingAmps == thresholds.minChargingAmps
+        assert result.lowSurplusCycles == 1
+
+    async def test_counter_resets_when_surplus_recovers(self, thresholds, pw_good):
+        """When surplus recovers (NONE/ADJUST), counter resets to 0."""
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=pw_good.avgSolarWatts // int(thresholds.chargerVoltage),
+            lowSurplusCycles=2,  # was accumulating
+        )
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert result.lowSurplusCycles == 0
+
+    async def test_stop_fires_after_enough_cycles_and_resets_counter(self, thresholds):
+        """After stopConfirmCycles consecutive low cycles, STOP fires and counter resets."""
+        low_pw = self._low_surplus_pw()
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=16,
+            lowSurplusCycles=thresholds.stopConfirmCycles - 1,
+        )
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        lucid.stop_charging.assert_awaited_once()
+        assert result.lowSurplusCycles == 0
+
+    async def test_hold_stop_sets_action_desc_with_reason(self, thresholds):
+        """HOLD_STOP action → lastActionDesc includes cycle count from reason string."""
+        low_pw = self._low_surplus_pw()
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=16,
+            lowSurplusCycles=0,
+        )
+        lucid, _ = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        result = await pollVehicleAndDecide(lucid, low_pw, thresholds, "", prevState=prev)
+        assert "confirming stop" in result.lastActionDesc
+        assert "1/" in result.lastActionDesc
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1186,7 @@ class TestGracefulShutdown:
                 "minChargingAmps": thresholds.minChargingAmps,
                 "maxChargingAmps": thresholds.maxChargingAmps,
                 "commandCooldownMinutes": thresholds.commandCooldownMinutes,
+                "stopConfirmCycles": thresholds.stopConfirmCycles,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 60,
@@ -1050,6 +1252,7 @@ class TestDecoupledPolling:
                 "minChargingAmps": 12,
                 "maxChargingAmps": 32,
                 "commandCooldownMinutes": 10,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": polling_interval,
@@ -1236,6 +1439,7 @@ class TestDecoupledPolling:
                 "minPowerwallSocPercent": 50, "targetEvChargePercent": 80,
                 "chargerVoltage": 240, "minChargingAmps": 12,
                 "maxChargingAmps": 32, "commandCooldownMinutes": 10,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 99999,
@@ -1357,8 +1561,9 @@ class TestprocessCycleSkip:
         pvad.assert_not_awaited()
         assert factor == 5
 
-    async def test_ev_at_target_skips_lucid_factor_60(self, thresholds, pw_good):
-        """EV at target SOC in cache → factor=60, not called."""
+    async def test_ev_at_target_skips_lucid_factor_ev_done(self, thresholds, pw_good):
+        """EV at target SOC in cache → factor=_INTERVAL_EV_DONE, not called."""
+        from chaos import _INTERVAL_EV_DONE
         cached = VehicleState(
             evSocPercent=thresholds.targetEvChargePercent,
             chargeState=CS.CHARGE_STATE_CABLE_CONNECTED,
@@ -1368,7 +1573,7 @@ class TestprocessCycleSkip:
         with patch("chaos.pollVehicleAndDecide", pvad):
             _, factor = await processCycle(lucid, thresholds, "", {"username": "u", "password": "p"}, cached, pwState=pw_good)
         pvad.assert_not_awaited()
-        assert factor == 60
+        assert factor == _INTERVAL_EV_DONE
 
     async def test_actively_charging_always_polls(self, thresholds):
         """Car in CHARGING_STATE → skip logic bypassed, pollVehicleAndDecide called."""
@@ -1925,6 +2130,33 @@ class TestExternalCharge:
         # External session detected — evChargingAmps must reflect actual charging
         assert result.evChargingAmps > 0
 
+    async def test_action_desc_shows_ext_session_taking_over(self, thresholds, pw_good):
+        """External session with interference=True → ACTION shows 'ext session — taking over'."""
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=0)
+
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert result.lastActionDesc == "ext session — taking over"
+
+    async def test_action_desc_shows_ext_session_observing(self, thresholds, pw_good):
+        """External session with interference=False → ACTION shows 'ext session — observing'."""
+        no_interference = ChargingThresholds(
+            minPowerwallSocPercent=thresholds.minPowerwallSocPercent,
+            targetEvChargePercent=thresholds.targetEvChargePercent,
+            chargerVoltage=thresholds.chargerVoltage,
+            minChargingAmps=thresholds.minChargingAmps,
+            maxChargingAmps=thresholds.maxChargingAmps,
+            commandCooldownMinutes=thresholds.commandCooldownMinutes,
+            allowExternalChargeInterference=False,
+        )
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+        prev = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=0)
+
+        result = await pollVehicleAndDecide(lucid, pw_good, no_interference, "", prevState=prev)
+        assert result.lastActionDesc == "ext session — observing"
+
 
 # ---------------------------------------------------------------------------
 # processCycle — dashboard EV fields
@@ -2125,6 +2357,102 @@ class TestWritePowerwallToConfig:
             _writePowerwallToConfig("Garage", path=str(cfg_file))
             mock_replace.assert_not_called()
         assert json.loads(cfg_file.read_text())["activePowerwall"] == "Garage"
+
+
+# ---------------------------------------------------------------------------
+# _saveLongHistory / _loadLongHistory
+# ---------------------------------------------------------------------------
+
+class TestLongHistoryPersistence:
+    """Tests for long history save/load helpers."""
+
+    def _make_site(self, name="Home"):
+        return SiteInfo(name=name, pw=None)
+
+    def _entry(self, ts):
+        return {"timestamp": ts, "solarWatts": 1000, "homeWatts": 500, "surplusKw": 0.5, "powerwallSocPercent": 80.0}
+
+    def test_round_trip(self, tmp_path, monkeypatch):
+        """Save and load preserves all entries."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        now = datetime.now(timezone.utc)
+        for i in range(3):
+            site.longHistory.append(self._entry((now - timedelta(minutes=i * 5)).isoformat()))
+        _saveLongHistory(site)
+
+        site2 = self._make_site()
+        _loadLongHistory(site2)
+        assert list(site2.longHistory) == list(site.longHistory)
+
+    def test_load_sets_lastLongHistoryTime(self, tmp_path, monkeypatch):
+        """lastLongHistoryTime is restored from the last entry's timestamp."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        ts = datetime.now(timezone.utc).isoformat()
+        site.longHistory.append(self._entry(ts))
+        _saveLongHistory(site)
+
+        site2 = self._make_site()
+        _loadLongHistory(site2)
+        assert site2.lastLongHistoryTime == datetime.fromisoformat(ts)
+
+    def test_stale_entries_filtered(self, tmp_path, monkeypatch):
+        """Entries older than 24 hours are dropped on load."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(seconds=_LONG_HISTORY_MAXLEN * _LONG_HISTORY_INTERVAL_SECS + 1)).isoformat()
+        fresh_ts = now.isoformat()
+        site.longHistory.append(self._entry(old_ts))
+        site.longHistory.append(self._entry(fresh_ts))
+        _saveLongHistory(site)
+
+        site2 = self._make_site()
+        _loadLongHistory(site2)
+        assert len(site2.longHistory) == 1
+        assert list(site2.longHistory)[0]["timestamp"] == fresh_ts
+
+    def test_missing_file_is_silent(self, tmp_path, monkeypatch):
+        """No error or exception when the history file does not exist."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        _loadLongHistory(site)  # file doesn't exist
+        assert len(site.longHistory) == 0
+        assert site.lastLongHistoryTime is None
+
+    def test_corrupt_file_logs_warning(self, tmp_path, monkeypatch, caplog):
+        """Corrupt JSON is caught; deque stays empty."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        _longHistoryPath(site.name).write_text("not valid json{{{")
+        with caplog.at_level("WARNING"):
+            _loadLongHistory(site)
+        assert len(site.longHistory) == 0
+        assert any("Failed to load" in r.message for r in caplog.records)
+
+    def test_entry_missing_timestamp_filtered(self, tmp_path, monkeypatch):
+        """Entries without a timestamp key are dropped."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        now = datetime.now(timezone.utc)
+        good = self._entry(now.isoformat())
+        bad = {"solarWatts": 500}  # no timestamp
+        _longHistoryPath(site.name).write_text(json.dumps([bad, good]))
+
+        site2 = self._make_site()
+        _loadLongHistory(site2)
+        assert len(site2.longHistory) == 1
+        assert list(site2.longHistory)[0]["solarWatts"] == 1000
+
+    def test_no_rename_over_bind_mount(self, tmp_path, monkeypatch):
+        """Does not use Path.replace() — avoids EBUSY on Docker bind mounts on Linux/Synology."""
+        monkeypatch.chdir(tmp_path)
+        site = self._make_site()
+        site.longHistory.append(self._entry(datetime.now(timezone.utc).isoformat()))
+        with patch("pathlib.Path.replace") as mock_replace:
+            _saveLongHistory(site)
+            mock_replace.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2665,6 +2993,7 @@ class TestRunChaosStartup:
                 "minChargingAmps": 6,
                 "maxChargingAmps": 48,
                 "commandCooldownMinutes": 5,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 60,
@@ -2689,6 +3018,7 @@ class TestRunChaosStartup:
                 "minChargingAmps": 6,
                 "maxChargingAmps": 48,
                 "commandCooldownMinutes": 5,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 60,
@@ -2712,6 +3042,7 @@ class TestRunChaosStartup:
                 "minChargingAmps": 6,
                 "maxChargingAmps": 48,
                 "commandCooldownMinutes": 5,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 60,
@@ -2735,6 +3066,7 @@ class TestRunChaosStartup:
                 "minChargingAmps": 6,
                 "maxChargingAmps": 48,
                 "commandCooldownMinutes": 5,
+                "stopConfirmCycles": 3,
             },
             "notifications": {"enabled": False},
             "pollingIntervalSeconds": 60,
@@ -3000,6 +3332,66 @@ class TestNonActiveSiteHistory:
 
 
 # ---------------------------------------------------------------------------
+# Long history (24h, 5-min resolution) recording via _pollAllSites
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPollAllSitesLongHistory:
+    """Verify the 5-minute-gated longHistory deque used by the 24-hour charts."""
+
+    def _make_site(self, name, solar=2000.0, home=800.0, soc=72.5):
+        pw_mock = MagicMock()
+        pw_mock.solar.return_value = solar
+        pw_mock.home.return_value = home
+        pw_mock.level.return_value = soc
+        return SiteInfo(name=name, pw=pw_mock)
+
+    async def test_first_poll_seeds_long_history(self):
+        """lastLongHistoryTime is None at startup → first poll appends immediately."""
+        site = self._make_site("SiteA")
+        await _pollAllSites({"SiteA": site})
+        assert len(site.longHistory) == 1
+        assert site.lastLongHistoryTime is not None
+
+    async def test_rapid_cycles_record_only_one_long_entry(self):
+        """Multiple polls within the 5-min interval add to history but not longHistory."""
+        site = self._make_site("SiteA")
+        for _ in range(4):
+            await _pollAllSites({"SiteA": site})
+        assert len(site.history) == 4       # every cycle
+        assert len(site.longHistory) == 1   # only the first, interval not elapsed
+
+    async def test_entry_appended_after_interval(self):
+        """A poll appends to longHistory once _LONG_HISTORY_INTERVAL_SECS has elapsed."""
+        from chaos import _LONG_HISTORY_INTERVAL_SECS
+        site = self._make_site("SiteA")
+        await _pollAllSites({"SiteA": site})
+        # Backdate the last long-history time past the interval to simulate elapsed time.
+        site.lastLongHistoryTime = datetime.now(timezone.utc) - timedelta(
+            seconds=_LONG_HISTORY_INTERVAL_SECS + 1
+        )
+        await _pollAllSites({"SiteA": site})
+        assert len(site.longHistory) == 2
+
+    async def test_long_history_shares_dict_object_with_history(self):
+        """The longHistory entry is the same dict object as in history (so EV updates propagate)."""
+        site = self._make_site("SiteA")
+        await _pollAllSites({"SiteA": site})
+        assert site.longHistory[-1] is site.history[-1]
+        # Mutating the shared entry (as _updateDashboard does) is visible in both.
+        site.history[-1]["evSocPercent"] = 55.0
+        assert site.longHistory[-1]["evSocPercent"] == 55.0
+
+    async def test_errored_site_gets_no_long_entry(self):
+        bad_pw = MagicMock()
+        bad_pw.solar.side_effect = RuntimeError("refused")
+        site = SiteInfo(name="Bad", pw=bad_pw)
+        await _pollAllSites({"Bad": site})
+        assert len(site.longHistory) == 0
+        assert site.lastLongHistoryTime is None
+
+
+# ---------------------------------------------------------------------------
 # Chart endpoints — multi-site series
 # ---------------------------------------------------------------------------
 
@@ -3042,8 +3434,10 @@ class TestWebChartMultiSite:
         import chaos
         siteA = SiteInfo(name="SiteA", pw=None)
         siteA.history = self._make_history(n=3, solar=3000.0)
+        siteA.longHistory = self._make_history(n=3, solar=3000.0)
         siteB = SiteInfo(name="SiteB", pw=None)
         siteB.history = self._make_history(n=3, solar=1500.0)
+        siteB.longHistory = self._make_history(n=3, solar=1500.0)
         with self._chaos_state({"SiteA": siteA, "SiteB": siteB}, "SiteA"):
             async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
                 resp = await client.get("/api/charts/power.svg")
@@ -3054,8 +3448,10 @@ class TestWebChartMultiSite:
         import chaos
         siteA = SiteInfo(name="SiteA", pw=None)
         siteA.history = self._make_history(n=3, soc=80.0)
+        siteA.longHistory = self._make_history(n=3, soc=80.0)
         siteB = SiteInfo(name="SiteB", pw=None)
         siteB.history = self._make_history(n=3, soc=55.0)
+        siteB.longHistory = self._make_history(n=3, soc=55.0)
         with self._chaos_state({"SiteA": siteA, "SiteB": siteB}, "SiteA"):
             async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
                 resp = await client.get("/api/charts/soc.svg")
@@ -3066,6 +3462,7 @@ class TestWebChartMultiSite:
         import chaos
         siteA = SiteInfo(name="SiteA", pw=None)
         siteA.history = self._make_history(n=3)
+        siteA.longHistory = self._make_history(n=3)
         with self._chaos_state({"SiteA": siteA}, "SiteA"):
             async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
                 resp = await client.get("/api/charts/power.svg")
@@ -3079,13 +3476,66 @@ class TestWebChartMultiSite:
         """When a non-active site has fewer entries, the series is padded with None at the front."""
         import chaos
         siteA = SiteInfo(name="SiteA", pw=None)
-        siteA.history = self._make_history(n=5)  # active: 5 entries
+        siteA.history = self._make_history(n=5)
+        siteA.longHistory = self._make_history(n=5)  # active: 5 entries
         siteB = SiteInfo(name="SiteB", pw=None)
-        siteB.history = self._make_history(n=3)  # non-active: only 3 entries
+        siteB.history = self._make_history(n=3)
+        siteB.longHistory = self._make_history(n=3)  # non-active: only 3 entries
         with self._chaos_state({"SiteA": siteA, "SiteB": siteB}, "SiteA"):
             async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
                 resp = await client.get("/api/charts/power.svg")
         assert resp.status_code == 200
+
+    def _make_recent_history(self, minutes_ago_list):
+        """Build a history deque with entries timestamped at the given minute offsets in the past."""
+        now = datetime.now(timezone.utc)
+        h = collections.deque(maxlen=120)
+        for m in minutes_ago_list:
+            ts = (now - timedelta(minutes=m)).isoformat()
+            h.append({
+                "timestamp": ts,
+                "solarWatts": 3000.0,
+                "homeWatts": 800.0,
+                "surplusKw": 2.2,
+                "powerwallSocPercent": 70.0,
+                "evSocPercent": 60.0,
+                "evChargingKw": 0.0,
+            })
+        return h
+
+    async def test_power_hour_includes_recent_entries(self):
+        """Entries within the last hour are charted by /api/charts/power-hour.svg."""
+        import chaos
+        siteA = SiteInfo(name="SiteA", pw=None)
+        siteA.history = self._make_recent_history([10, 5, 1])  # all within the hour
+        with self._chaos_state({"SiteA": siteA}, "SiteA"):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/power-hour.svg")
+        assert resp.status_code == 200
+        assert "Solar" in resp.text
+        assert "No data yet" not in resp.text
+
+    async def test_power_hour_excludes_old_entries(self):
+        """When fewer than 2 entries fall within the last hour, the placeholder is returned."""
+        import chaos
+        siteA = SiteInfo(name="SiteA", pw=None)
+        siteA.history = self._make_recent_history([180, 120, 90])  # all older than 1 hour
+        with self._chaos_state({"SiteA": siteA}, "SiteA"):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/power-hour.svg")
+        assert resp.status_code == 200
+        assert "No data yet" in resp.text
+
+    async def test_power_hour_filters_to_window(self):
+        """A mix of old and recent entries charts only the recent ones (no crash, valid SVG)."""
+        import chaos
+        siteA = SiteInfo(name="SiteA", pw=None)
+        siteA.history = self._make_recent_history([200, 150, 30, 10, 2])  # 3 within the hour
+        with self._chaos_state({"SiteA": siteA}, "SiteA"):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/power-hour.svg")
+        assert resp.status_code == 200
+        assert "Solar" in resp.text
 
 
 # ---------------------------------------------------------------------------

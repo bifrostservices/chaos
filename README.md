@@ -143,6 +143,7 @@ Thresholds and limits that govern the charging decision engine.
 | `minChargingAmps` | number | — | Minimum charge current in amps. CHAOS will not command a current below this value. Also determines the minimum surplus required to start charging (`minChargingAmps × chargerVoltage / 1000` kW). |
 | `maxChargingAmps` | number | — | Maximum charge current in amps. CHAOS will never command more than this, regardless of available surplus. |
 | `commandCooldownMinutes` | number | — | After issuing a start or stop command, CHAOS waits this many minutes before considering another stop or start. Protects the vehicle's high-voltage contactors from rapid cycling. |
+| `stopConfirmCycles` | number | `3` | Number of consecutive polling cycles where surplus is insufficient before CHAOS issues a STOP. Higher values tolerate short solar dips (clouds, transient loads) without stopping. Set to `1` to stop on the first low-surplus cycle. |
 | `allowExternalChargeInterference` | boolean | `true` | If `true`, CHAOS takes over externally-started charging sessions (e.g. sessions you started manually) and manages the current. If `false`, CHAOS observes but does not interfere with sessions it did not start. |
 
 **Example:**
@@ -154,6 +155,7 @@ Thresholds and limits that govern the charging decision engine.
   "minChargingAmps": 12,
   "maxChargingAmps": 32,
   "commandCooldownMinutes": 10,
+  "stopConfirmCycles": 3,
   "allowExternalChargeInterference": true
 }
 ```
@@ -171,7 +173,7 @@ Base interval in seconds between poll cycles. The actual sleep time is multiplie
 | Insufficient surplus (not dark) | 1× | 60 s |
 | Powerwall SOC below minimum | 5× | 5 min |
 | No solar production (dark/overcast) | 10× | 10 min |
-| EV at target charge level | 60× | 1 hr |
+| EV at target charge level | 20× | 20 min |
 
 ---
 

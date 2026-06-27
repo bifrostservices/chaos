@@ -4,7 +4,10 @@ chaos.log
 __pycache__/
 .powerwall*
 launch.json
+long*.json
 *.tar
+CLAUDE.md
+.antigravitycli/
 
 # General
 .DS_Store
