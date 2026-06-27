@@ -233,3 +233,4 @@ CHAOS is only possible thanks to several excellent open-source projects:
 - **[pypowerwall](https://github.com/jasonacox/pypowerwall)** by Jason Cox — local Powerwall API client that provides all solar, home load, and battery state data.
 - **[python-lucidmotors](https://github.com/nshp/python-lucidmotors)** by nshp — community-developed Lucid Motors API client used to start, stop, and adjust EV charging.
 - **[FastAPI](https://fastapi.tiangolo.com/)** by Sebastián Ramírez — ASGI web framework serving the live dashboard.
+
