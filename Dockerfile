@@ -1,4 +1,5 @@
 FROM python:3.13-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # git is required to install python-lucidmotors directly from GitHub
 RUN apt-get update \
@@ -8,20 +9,17 @@ RUN apt-get update \
 WORKDIR /app
 
 # Install Python dependencies before copying the app so this layer is cached
-# as long as requirements.txt doesn't change.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# as long as pyproject.toml/uv.lock don't change.
+COPY pyproject.toml uv.lock .
+RUN uv sync --locked --no-dev --no-install-project
 
 COPY chaos.py .
 COPY pygal-tooltips.min.js .
 
 # config.json is bind-mounted at runtime — never bake credentials into the image.
-# chaos.log is bind-mounted at runtime so logs are accessible on the host.
+# data/ (chaos.log + long-history JSON) is bind-mounted at runtime for persistence.
 
 EXPOSE 8087
 
-# `touch` ensures chaos.log exists as a file before Python opens it as a FileHandler.
-# On Linux, bind-mounting a file that doesn't exist on the host causes Docker to create
-# a directory there instead — which makes Python's FileHandler crash with IsADirectoryError.
 # `exec` replaces sh with Python so the process remains PID 1 and receives SIGTERM cleanly.
-CMD ["sh", "-c", "touch /app/chaos.log && exec python chaos.py"]
+CMD ["sh", "-c", "exec uv run --no-dev python chaos.py"]

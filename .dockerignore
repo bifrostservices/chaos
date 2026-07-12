@@ -7,7 +7,7 @@ __pycache__/
 # Credentials and local state — never bake into the image
 config.json
 .powerwall-*
-chaos.log
+data/
 
 # Tests — not needed in the image
 test_*.py

@@ -29,22 +29,18 @@ CHAOS was motivated by integrating a Lucid Gravity into a previously all-Tesla g
 ## Running standalone
 
 ```bash
-# Create and activate a virtual environment
-python3.13 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+# Create the virtual environment and install dependencies
+uv sync
 
 # Copy and fill in the example config
 cp config.example.json config.json
 $EDITOR config.json
 
 # Run
-python chaos.py
+uv run python chaos.py
 ```
 
-Logs are written to stdout and to `chaos.log` in the working directory. The web dashboard is available at `http://localhost:8087` (or whichever port you set in `dashboard.port`).
+Logs are written to stdout and to `data/chaos.log`. The web dashboard is available at `http://localhost:8087` (or whichever port you set in `dashboard.port`).
 
 ## Running in Docker
 
@@ -65,7 +61,7 @@ docker buildx build --platform linux/arm64 --load .   # Apple Silicon
 docker buildx build --platform linux/amd64,linux/arm64 --push -t yourrepo/chaos:latest .
 ```
 
-The `docker-compose.yml` bind-mounts `config.json` read-only and `chaos.log` for persistence. The container exposes port 8087.
+The `docker-compose.yml` bind-mounts `config.json` read-write (CHAOS persists active-Powerwall changes back to it) and a `data/` directory (`chaos.log` and 24-hour history charts) so both survive container rebuilds. The container exposes port 8087.
 
 ## Configuration reference
 
@@ -93,7 +89,7 @@ List of one or more Powerwall gateways. Multiple entries enable the site-switchi
 |-----|------|-------------|
 | `name` | string | Unique label for this site (e.g. `"home"`). Referenced by `activePowerwall`. |
 | `host` | string | Local IP address or hostname of the Powerwall gateway. |
-| `authType` | string | `"local"` for standard local API auth; `"TEDAPI"` for TEDAPl auth. |
+| `authType` | string | `"local"` for standard local API auth; `"TEDAPI"` for TEDAPI auth. |
 | `password` | string | Gateway password (used for both auth types). |
 | `email` | string | Tesla account email associated with the gateway. |
 | `timezone` | string | IANA timezone string for the gateway (e.g. `"America/Chicago"`). |
@@ -143,7 +139,7 @@ Thresholds and limits that govern the charging decision engine.
 | `minChargingAmps` | number | — | Minimum charge current in amps. CHAOS will not command a current below this value. Also determines the minimum surplus required to start charging (`minChargingAmps × chargerVoltage / 1000` kW). |
 | `maxChargingAmps` | number | — | Maximum charge current in amps. CHAOS will never command more than this, regardless of available surplus. |
 | `commandCooldownMinutes` | number | — | After issuing a start or stop command, CHAOS waits this many minutes before considering another stop or start. Protects the vehicle's high-voltage contactors from rapid cycling. |
-| `stopConfirmCycles` | number | `3` | Number of consecutive polling cycles where surplus is insufficient before CHAOS issues a STOP. Higher values tolerate short solar dips (clouds, transient loads) without stopping. Set to `1` to stop on the first low-surplus cycle. |
+| `stopConfirmCycles` | number | `4` | Number of consecutive polling cycles where surplus is insufficient before CHAOS issues a STOP. Higher values tolerate short solar dips (clouds, transient loads) without stopping. Set to `1` to stop on the first low-surplus cycle. |
 | `allowExternalChargeInterference` | boolean | `true` | If `true`, CHAOS takes over externally-started charging sessions (e.g. sessions you started manually) and manages the current. If `false`, CHAOS observes but does not interfere with sessions it did not start. |
 
 **Example:**
@@ -173,7 +169,7 @@ Base interval in seconds between poll cycles. The actual sleep time is multiplie
 | Insufficient surplus (not dark) | 1× | 60 s |
 | Powerwall SOC below minimum | 5× | 5 min |
 | No solar production (dark/overcast) | 10× | 10 min |
-| EV at target charge level | 20× | 20 min |
+| EV at target charge level, or charging disabled by user | 60× | 60 min |
 
 ---
 
@@ -186,7 +182,7 @@ Web UI settings.
 | `port` | number | `8087` | TCP port for the web dashboard. Set to `0` to disable the web server. |
 | `units` | string | `"imperial"` | Display units. `"imperial"` shows miles; `"metric"` shows kilometres. |
 | `ratedRangeMiles` | number or null | `null` | Rated range of the vehicle in miles, used to display an estimated range alongside SOC. Set to `null` to omit. |
-| `apiKey` | string | `""` | If non-empty, the mutation endpoints (`/api/poll` and `/api/powerwall`) require an `X-API-Key` header matching this value. Read-only endpoints (dashboard state, charts) remain open. Leave empty to disable authentication. |
+| `apiKey` | string | `""` | If non-empty, the mutation endpoints (`/api/poll`, `/api/charging`, and `/api/powerwall`) require an `X-API-Key` header matching this value. Read-only endpoints (dashboard state, charts) remain open. Leave empty to disable authentication. |
 
 ---
 
@@ -199,7 +195,7 @@ Webhook notifications for charging events and errors.
 | `enabled` | boolean | `false` | Set to `true` to enable webhook notifications. |
 | `webhookUrl` | string | `""` | URL to POST notifications to. Google Chat webhook URLs (`chat.googleapis.com`) are handled automatically — only the `text` field is sent. Other URLs receive a full JSON payload with event details. |
 
-Notifications fire on: charging started, charging stopped, and poll cycle errors.
+Notifications fire on: charging started, charging stopped, auto site-switch (when multiple Powerwalls are configured), and poll cycle errors.
 
 **Example payload (non-Google-Chat):**
 ```json

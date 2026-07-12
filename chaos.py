@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Run with:
-#   source .venv/bin/activate
-#   python3 chaos.py
+#   uv run python chaos.py
 
 # CHAOS: CHarging Automatically On Solar
 # Copyright (c) 2026 Erik Jacobsen
@@ -33,7 +32,7 @@ import json
 import logging
 import pathlib
 import signal
-import requests
+import httpx
 from urllib.parse import urlparse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -51,13 +50,18 @@ import uvicorn
 
 __version__ = "0.5.0"
 
+# Directory for runtime-generated files (chaos.log, long-history JSON) so a single
+# Docker bind mount persists all of them across container rebuilds.
+_DATA_DIR = pathlib.Path("data")
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("chaos.log"),
+        logging.FileHandler(_DATA_DIR / "chaos.log"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -355,6 +359,7 @@ class DashboardState:
     vehicleLastPolled: datetime | None = None  # last time pollVehicleAndDecide ran
     vehicleSoftwareVersion: str = ""
     ratedRangeMiles: float | None = None  # from config; enables range card gradient fill
+    targetEvChargePercent: float | None = None  # from config; draws target marker on EV card
     units: str = "imperial"               # "imperial" (mi) or "metric" (km)
     version: str = ""                     # set once at startup from __version__
     nextPollAt: datetime | None = None    # when the next backend poll cycle is expected to run
@@ -375,7 +380,7 @@ _DASHED_PREFIX          = "╌╌ "                        # legend label prefix
 _DASHED_STYLE           = {"stroke_style": {"dasharray": "8 3", "width": 2.5}}
 _PYGAL_DEFAULT_COLORS   = ("#fbbf24", "#38bdf8", "#4ade80", "#a78bfa")
 _CHART_NO_DATA = (
-    b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">'
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">'
     b'<text x="50%" y="50%" fill="#64748b" text-anchor="middle" font-family="system-ui">'
     b'No data yet</text></svg>'
 )
@@ -445,7 +450,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .toggle-btn.toggle-disable.toggle-active{background:#450a0a;color:#fca5a5;border-color:#7f1d1d;cursor:default}
   .chart-section{margin-bottom:24px}
   .chart-section h2{margin-bottom:8px}
-  .chart-wrap{background:#1e293b;border-radius:10px;padding:4px;border:1px solid #334155;margin-bottom:10px;max-width:50%}
+  .chart-wrap{background:#1e293b;border-radius:10px;padding:4px;border:1px solid #334155;margin-bottom:10px;max-width:1400px}
   .chart-wrap svg{width:100%;height:auto;display:block}
   .title-row{display:flex;align-items:center;justify-content:space-between}
   .site-row-header{display:flex;align-items:center;gap:10px;margin:16px 0 6px}
@@ -503,11 +508,14 @@ function surpFmt(v){
   const cls=v>=0?'pos':'neg';
   return'<span class="'+cls+'">'+(v>=0?'+':'')+v.toFixed(2)+'kW</span>';
 }
-function fillBg(id,pct,color){
+function fillBg(id,pct,color,markerPct){
   const el=document.getElementById(id);
   if(!el)return;
   const p=Math.max(0,Math.min(100,pct||0));
-  el.style.background='linear-gradient(to right,'+color+' '+p+'%,transparent '+p+'%)';
+  const fill='linear-gradient(to right,'+color+' '+p+'%,transparent '+p+'%)';
+  if(markerPct==null){el.style.background=fill;return;}
+  const m=Math.max(0,Math.min(100,markerPct));
+  el.style.background='linear-gradient(to right,transparent calc('+m+'% - 1px),rgba(74,222,128,0.9) calc('+m+'% - 1px),rgba(74,222,128,0.9) calc('+m+'% + 1px),transparent calc('+m+'% + 1px)),'+fill;
 }
 function fillTdBg(pct,color){
   const p=Math.max(0,Math.min(100,pct||0));
@@ -594,7 +602,7 @@ function refresh(){
     document.getElementById('range').textContent=rangeFmt;
     document.getElementById('cs').innerHTML=badge(d.chargeStateName);
     document.getElementById('amps').textContent=d.evChargingAmps>0?d.evChargingAmps+'A':'—';
-    fillBg('card-ev',d.evSocPercent,'rgba(74,222,128,0.22)');
+    fillBg('card-ev',d.evSocPercent,'rgba(74,222,128,0.22)',d.targetEvChargePercent);
     if(d.ratedRangeMiles!=null&&d.vehicleRangeKm!=null)
       fillBg('card-range',d.vehicleRangeKm/(d.ratedRangeMiles*1.60934)*100,'rgba(251,191,36,0.22)');
     const eb=document.getElementById('err');
@@ -755,7 +763,7 @@ _LOG_TAIL_LINES = 2000  # max lines served by /api/log to bound memory use on la
 
 @_webApp.get("/api/log", response_class=fastapi.responses.Response)
 async def _webApiLog():
-    log_path = pathlib.Path("chaos.log")
+    log_path = _DATA_DIR / "chaos.log"
     if not log_path.exists():
         return fastapi.Response(content="(log file not found)", media_type="text/plain; charset=utf-8")
     lines = log_path.read_text(errors="replace").splitlines()
@@ -887,14 +895,13 @@ async def sendWebhook(url, payload):
         text = payload.get("text") or json.dumps(payload)
         payload = {"text": text}
     try:
-        # requests is used intentionally here — a single fire-and-forget POST
-        # doesn't warrant adding an async httpx dependency.
-        response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
-        if response.status_code == 429:
-            await asyncio.sleep(_WEBHOOK_RETRY_DELAY_SECS)
-            response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
-        if not response.ok:
-            log.warning(f"[Webhook] Returned {response.status_code}: {response.text[:200]}")
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.post(url, json=payload, timeout=10)
+            if response.status_code == 429:
+                await asyncio.sleep(_WEBHOOK_RETRY_DELAY_SECS)
+                response = await client.post(url, json=payload, timeout=10)
+            if not response.is_success:
+                log.warning(f"[Webhook] Returned {response.status_code}: {response.text[:200]}")
     except Exception as e:
         log.warning(f"[Webhook] Delivery failed: {e}")
 
@@ -1216,6 +1223,7 @@ def _chargeStateName(chargeState) -> str:
     try:
         return ChargeState.Name(int(chargeState))
     except Exception:
+        log.warning("Unknown ChargeState value: %r", chargeState)
         return str(chargeState)
 
 
@@ -1254,10 +1262,12 @@ def _vehicleModelName(vehicle) -> str:
     try:
         model = Model.Name(vehicle.config.model).replace("MODEL_", "").replace("_", " ").title()
     except Exception:
+        log.warning("Unknown Model value: %r", vehicle.config.model)
         model = str(vehicle.config.model)
     try:
         variant = ModelVariant.Name(vehicle.config.variant).replace("MODEL_VARIANT_", "").replace("_", " ").title()
     except Exception:
+        log.warning("Unknown ModelVariant value: %r", vehicle.config.variant)
         variant = str(vehicle.config.variant)
     return f"{model} {variant}".strip()
 
@@ -1295,9 +1305,8 @@ def _shouldForceEarlyEvPoll(
     )
     if inCooldown:
         return False
-    minEvLoadKw = thresholds.minChargingAmps * thresholds.chargerVoltage / 1000
     homeRiseKw = (history[-1]["homeWatts"] - history[-2]["homeWatts"]) / 1000
-    return homeRiseKw >= minEvLoadKw
+    return homeRiseKw >= thresholds.minSurplusKw
 
 
 async def processCycle(
@@ -1413,12 +1422,14 @@ async def _connectPowerwall(pwConfig: dict, name: str) -> pypowerwall.Powerwall:
 
 
 def _longHistoryPath(siteName: str) -> pathlib.Path:
-    return pathlib.Path(f"long_history_{siteName}.json")
+    return _DATA_DIR / f"long_history_{siteName}.json"
 
 
 def _saveLongHistory(site: "SiteInfo") -> None:
     try:
-        _longHistoryPath(site.name).write_text(json.dumps(list(site.longHistory)))
+        path = _longHistoryPath(site.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(list(site.longHistory)))
     except Exception as e:
         log.warning(f"[{site.name}] Failed to save long history: {e}")
 
@@ -1654,6 +1665,7 @@ async def runChaos(config):
 
         _dashboard.units = units
         _dashboard.ratedRangeMiles = dashboard_cfg.get("ratedRangeMiles")
+        _dashboard.targetEvChargePercent = thresholds.targetEvChargePercent
         _dashboard.version = __version__
         _dashboard.activePowerwall = activeName
         _dashboard.powerwallNames = [p["name"] for p in config["powerwalls"]]
@@ -1707,12 +1719,11 @@ async def runChaos(config):
                     # Check whether a home-load spike suggests the EV just arrived and plugged in.
                     # If so, skip the sleep and force an immediate EV poll next cycle.
                     if _shouldForceEarlyEvPoll(allSites[activeName].history, cachedState, thresholds):
-                        minEvLoadKw = thresholds.minChargingAmps * thresholds.chargerVoltage / 1000
                         active_hist = allSites[activeName].history
                         homeRiseKw = (active_hist[-1]["homeWatts"] - active_hist[-2]["homeWatts"]) / 1000
                         log.info(
                             f"[{activeName}] Home load spike: +{homeRiseKw:.2f}kW "
-                            f"(≥{minEvLoadKw:.2f}kW threshold) — EV was unplugged, forcing immediate poll"
+                            f"(≥{thresholds.minSurplusKw:.2f}kW threshold) — EV was unplugged, forcing immediate poll"
                         )
                         forcedEvPollPending = True
                         _forcePoll.set()

@@ -24,8 +24,9 @@ services:
     volumes:
       # config.json contains credentials — mount read-write since can change active Powerwall site
       - ./config.json:/app/config.json
-      # chaos.log persists on the host across container restarts
-      - ./chaos.log:/app/chaos.log
+      # data/ persists chaos.log and 24h long-history JSON (per site) across container rebuilds.
+      # Directory bind mounts auto-create the host dir if missing — no touch workaround needed.
+      - ./data:/app/data
     # Bridge networking (default) routes to the local LAN correctly on all
     # platforms — macOS, Windows, Linux, and Synology — without needing
     # --network host. The Powerwall IP in config.json is reached directly.

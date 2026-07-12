@@ -1,12 +1,12 @@
 config.json
 chaos.log
+/data/
 .venv/
 __pycache__/
 .powerwall*
 launch.json
 long*.json
 *.tar
-CLAUDE.md
 .antigravitycli/
 
 # General

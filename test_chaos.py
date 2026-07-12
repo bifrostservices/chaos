@@ -596,97 +596,114 @@ class TestDecideUnknownState:
 
 @pytest.mark.asyncio
 class TestSendWebhook:
+    def _mock_client(self, *responses):
+        """Return (patch, mock_client) where mock_client.post returns the given responses."""
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=list(responses))
+        return patch("chaos.httpx.AsyncClient", return_value=mock_client), mock_client
+
+    def _ok(self, status_code=200):
+        return MagicMock(is_success=True, status_code=status_code, text="")
+
+    def _err(self, status_code=400, text="Bad Request"):
+        return MagicMock(is_success=False, status_code=status_code, text=text)
+
     async def test_posts_to_url(self):
-        with patch("chaos.requests.post") as mock_post:
+        p, mock_client = self._mock_client(self._ok())
+        with p:
             await sendWebhook("https://example.com/hook", {"event": "test"})
-            mock_post.assert_called_once()
-            args, kwargs = mock_post.call_args
-            assert args[0] == "https://example.com/hook"
-            assert kwargs["json"] == {"event": "test"}
+        mock_client.post.assert_awaited_once_with(
+            "https://example.com/hook", json={"event": "test"}, timeout=10
+        )
 
     async def test_no_op_when_url_empty(self):
-        with patch("chaos.requests.post") as mock_post:
+        p, mock_client = self._mock_client()
+        with p:
             await sendWebhook("", {"event": "test"})
-            mock_post.assert_not_called()
+        mock_client.post.assert_not_awaited()
 
     async def test_swallows_exception_and_logs_warning(self):
-        with patch("chaos.requests.post", side_effect=ConnectionError("timeout")):
-            with patch("chaos.log") as mock_log:
-                await sendWebhook("https://example.com/hook", {"event": "test"})
-                mock_log.warning.assert_called_once()
+        p, mock_client = self._mock_client()
+        mock_client.post = AsyncMock(side_effect=ConnectionError("timeout"))
+        with p, patch("chaos.log") as mock_log:
+            await sendWebhook("https://example.com/hook", {"event": "test"})
+        mock_log.warning.assert_called_once()
 
     async def test_logs_warning_on_non_2xx_response(self):
-        mock_response = MagicMock()
-        mock_response.ok = False
-        mock_response.status_code = 400
-        mock_response.text = "Bad Request"
-        with patch("chaos.requests.post", return_value=mock_response):
-            with patch("chaos.log") as mock_log:
-                await sendWebhook("https://example.com/hook", {"event": "test"})
-                mock_log.warning.assert_called_once()
+        p, _ = self._mock_client(self._err(400, "Bad Request"))
+        with p, patch("chaos.log") as mock_log:
+            await sendWebhook("https://example.com/hook", {"event": "test"})
+        mock_log.warning.assert_called_once()
 
     async def test_google_chat_strips_extra_fields(self):
         """Google Chat only accepts {text}, so extra keys must be stripped."""
-        with patch("chaos.requests.post") as mock_post:
-            payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        p, mock_client = self._mock_client(self._ok())
+        payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        with p:
             await sendWebhook("https://chat.googleapis.com/v1/spaces/ABC/messages?key=x", payload)
-            _, kwargs = mock_post.call_args
-            assert kwargs["json"] == {"text": "hello"}
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"] == {"text": "hello"}
 
     async def test_google_chat_falls_back_to_json_dump_when_no_text(self):
         """If payload has no 'text' key (e.g. error events), fall back to JSON dump."""
-        with patch("chaos.requests.post") as mock_post:
-            payload = {"event": "error", "message": "oops"}
+        p, mock_client = self._mock_client(self._ok())
+        payload = {"event": "error", "message": "oops"}
+        with p:
             await sendWebhook("https://chat.googleapis.com/v1/spaces/ABC/messages?key=x", payload)
-            _, kwargs = mock_post.call_args
-            sent = kwargs["json"]
-            assert set(sent.keys()) == {"text"}
-            assert "error" in sent["text"]  # JSON dump contains the event field
+        _, kwargs = mock_client.post.call_args
+        sent = kwargs["json"]
+        assert set(sent.keys()) == {"text"}
+        assert "error" in sent["text"]  # JSON dump contains the event field
 
     async def test_non_google_chat_preserves_all_fields(self):
         """Generic webhooks receive the full structured payload."""
-        with patch("chaos.requests.post") as mock_post:
-            payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        p, mock_client = self._mock_client(self._ok())
+        payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        with p:
             await sendWebhook("https://hooks.example.com/notify", payload)
-            _, kwargs = mock_post.call_args
-            assert kwargs["json"] == payload
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"] == payload
 
     async def test_google_chat_hostname_in_query_param_is_not_matched(self):
         """A URL with chat.googleapis.com in the query string must NOT be treated as Google Chat."""
-        with patch("chaos.requests.post") as mock_post:
-            payload = {"text": "hello", "event": "test", "solarWatts": 3000}
-            url = "https://evil.com/hook?redirect=chat.googleapis.com"
+        p, mock_client = self._mock_client(self._ok())
+        payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        url = "https://evil.com/hook?redirect=chat.googleapis.com"
+        with p:
             await sendWebhook(url, payload)
-            _, kwargs = mock_post.call_args
-            assert kwargs["json"] == payload  # full payload preserved — not stripped
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"] == payload  # full payload preserved — not stripped
 
     async def test_google_chat_subdomain_is_matched(self):
         """A subdomain of chat.googleapis.com should also be treated as Google Chat."""
-        with patch("chaos.requests.post") as mock_post:
-            payload = {"text": "hello", "event": "test", "solarWatts": 3000}
-            url = "https://subdomain.chat.googleapis.com/v1/spaces/ABC/messages"
+        p, mock_client = self._mock_client(self._ok())
+        payload = {"text": "hello", "event": "test", "solarWatts": 3000}
+        url = "https://subdomain.chat.googleapis.com/v1/spaces/ABC/messages"
+        with p:
             await sendWebhook(url, payload)
-            _, kwargs = mock_post.call_args
-            assert kwargs["json"] == {"text": "hello"}  # stripped to text-only
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"] == {"text": "hello"}  # stripped to text-only
 
     async def test_retries_once_on_429(self):
         """429 response triggers one retry after _WEBHOOK_RETRY_DELAY_SECS; succeeds on second attempt."""
-        rate_limited = MagicMock(ok=False, status_code=429, text="Too Many Requests")
-        success = MagicMock(ok=True, status_code=200)
-        with patch("chaos.requests.post", side_effect=[rate_limited, success]) as mock_post, \
-             patch("chaos.asyncio.sleep", new=AsyncMock()) as mock_sleep, \
+        p, mock_client = self._mock_client(
+            self._err(429, "Too Many Requests"), self._ok()
+        )
+        with p, patch("chaos.asyncio.sleep", new=AsyncMock()) as mock_sleep, \
              patch("chaos.log") as mock_log:
             await sendWebhook("https://example.com/hook", {"event": "test"})
-        assert mock_post.call_count == 2
+        assert mock_client.post.await_count == 2
         mock_sleep.assert_awaited_once()
         mock_log.warning.assert_not_called()
 
     async def test_logs_warning_when_retry_also_fails(self):
         """429 followed by another non-2xx on retry → logs a warning."""
-        rate_limited = MagicMock(ok=False, status_code=429, text="Too Many Requests")
-        still_bad = MagicMock(ok=False, status_code=503, text="Service Unavailable")
-        with patch("chaos.requests.post", side_effect=[rate_limited, still_bad]), \
-             patch("chaos.asyncio.sleep", new=AsyncMock()), \
+        p, _ = self._mock_client(
+            self._err(429, "Too Many Requests"), self._err(503, "Service Unavailable")
+        )
+        with p, patch("chaos.asyncio.sleep", new=AsyncMock()), \
              patch("chaos.log") as mock_log:
             await sendWebhook("https://example.com/hook", {"event": "test"})
         mock_log.warning.assert_called_once()
@@ -2284,6 +2301,7 @@ class TestHTMLTemplate:
             "siteReadings",
             "activePowerwall",
             "history",
+            "targetEvChargePercent",
         ):
             assert key in d, f"Missing key '{key}' in /api/state response"
 
@@ -2425,6 +2443,7 @@ class TestLongHistoryPersistence:
         """Corrupt JSON is caught; deque stays empty."""
         monkeypatch.chdir(tmp_path)
         site = self._make_site()
+        _longHistoryPath(site.name).parent.mkdir(parents=True, exist_ok=True)
         _longHistoryPath(site.name).write_text("not valid json{{{")
         with caplog.at_level("WARNING"):
             _loadLongHistory(site)
@@ -2438,6 +2457,7 @@ class TestLongHistoryPersistence:
         now = datetime.now(timezone.utc)
         good = self._entry(now.isoformat())
         bad = {"solarWatts": 500}  # no timestamp
+        _longHistoryPath(site.name).parent.mkdir(parents=True, exist_ok=True)
         _longHistoryPath(site.name).write_text(json.dumps([bad, good]))
 
         site2 = self._make_site()
@@ -2453,6 +2473,16 @@ class TestLongHistoryPersistence:
         with patch("pathlib.Path.replace") as mock_replace:
             _saveLongHistory(site)
             mock_replace.assert_not_called()
+
+    def test_save_creates_data_directory(self, tmp_path, monkeypatch):
+        """_saveLongHistory creates the data/ directory if it doesn't exist yet."""
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / "data").exists()
+        site = self._make_site()
+        site.longHistory.append(self._entry(datetime.now(timezone.utc).isoformat()))
+        _saveLongHistory(site)
+        assert (tmp_path / "data").is_dir()
+        assert _longHistoryPath(site.name).exists()
 
 
 # ---------------------------------------------------------------------------

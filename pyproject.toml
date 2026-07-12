@@ -1,0 +1,27 @@
+[project]
+name = "chaos"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "async-lru==2.3.0",
+    "fastapi==0.135.3",
+    "grpcio==1.78.0",
+    "httpx==0.28.1",
+    "lucidmotors",
+    "pygal==3.1.0",
+    "pypowerwall==0.14.10",
+    "starlette>=1.0.1",
+    "tenacity==9.1.4",
+    "uvicorn==0.44.0",
+]
+
+[tool.uv.sources]
+lucidmotors = { git = "https://github.com/nshp/python-lucidmotors.git", rev = "1f9de955645c78bb343b75ba079bdddfc6f5d458" }
+
+[dependency-groups]
+dev = [
+    "grpc-stubs==1.53.0.6",
+    "pytest>=9.0.3",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov==5.0.0",
+]
