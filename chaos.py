@@ -47,8 +47,9 @@ import fastapi
 import grpc
 import pygal
 import uvicorn
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Directory for runtime-generated files (chaos.log, long-history JSON) so a single
 # Docker bind mount persists all of them across container rebuilds.
@@ -187,6 +188,13 @@ def _validateConfig(config: dict) -> None:
         if authType not in ("local", "TEDAPI"):
             raise RuntimeError(
                 f"Invalid authType '{authType}' in powerwalls['{entryName}']: must be 'local' or 'TEDAPI'"
+            )
+
+    allowedHosts = config.get("dashboard", {}).get("allowedHosts")
+    if allowedHosts is not None:
+        if not isinstance(allowedHosts, list) or not all(isinstance(h, str) and h for h in allowedHosts):
+            raise RuntimeError(
+                "config['dashboard']['allowedHosts'] must be a list of non-empty host strings"
             )
 
     require(config["lucid"], ["username", "password"], "config['lucid']")
@@ -1677,6 +1685,12 @@ async def runChaos(config):
         global _webApiKey
         _webApiKey = dashboard_cfg.get("apiKey", "")
         if webUiPort:
+            allowedHosts = dashboard_cfg.get("allowedHosts")
+            if allowedHosts:
+                # Reject requests whose Host header isn't in the allowlist (400) —
+                # defeats DNS-rebinding attacks from browsers on the local network.
+                _webApp.add_middleware(TrustedHostMiddleware, allowed_hosts=allowedHosts)
+                log.info(f"Host-header validation enabled for: {', '.join(allowedHosts)}")
             server = uvicorn.Server(uvicorn.Config(_webApp, host="0.0.0.0", port=webUiPort, log_level="warning"))
             _serverTask = asyncio.create_task(server.serve())
             log.info(f"Web UI available at http://0.0.0.0:{webUiPort}")

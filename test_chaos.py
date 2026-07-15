@@ -2804,6 +2804,39 @@ class TestConfigValidation:
         with pytest.raises(RuntimeError, match="authType"):
             _validateConfig(config)
 
+    def test_allowed_hosts_valid_list_passes(self):
+        """A list of host strings in dashboard.allowedHosts is accepted."""
+        config = _make_valid_config(dashboard={"allowedHosts": ["192.168.1.50", "chaos.local"]})
+        _validateConfig(config)  # should not raise
+
+    def test_allowed_hosts_empty_list_passes(self):
+        """An empty allowedHosts list is accepted (feature disabled)."""
+        config = _make_valid_config(dashboard={"allowedHosts": []})
+        _validateConfig(config)  # should not raise
+
+    def test_allowed_hosts_absent_passes(self):
+        """A dashboard section without allowedHosts is accepted."""
+        config = _make_valid_config(dashboard={"port": 8087})
+        _validateConfig(config)  # should not raise
+
+    def test_allowed_hosts_not_a_list_raises(self):
+        """A non-list allowedHosts value raises RuntimeError."""
+        config = _make_valid_config(dashboard={"allowedHosts": "chaos.local"})
+        with pytest.raises(RuntimeError, match="allowedHosts"):
+            _validateConfig(config)
+
+    def test_allowed_hosts_non_string_entry_raises(self):
+        """A non-string entry in allowedHosts raises RuntimeError."""
+        config = _make_valid_config(dashboard={"allowedHosts": ["chaos.local", 8087]})
+        with pytest.raises(RuntimeError, match="allowedHosts"):
+            _validateConfig(config)
+
+    def test_allowed_hosts_empty_string_entry_raises(self):
+        """An empty-string entry in allowedHosts raises RuntimeError."""
+        config = _make_valid_config(dashboard={"allowedHosts": [""]})
+        with pytest.raises(RuntimeError, match="allowedHosts"):
+            _validateConfig(config)
+
 
 # ---------------------------------------------------------------------------
 # PHASE 1: loadConfig Tests

@@ -25,6 +25,7 @@ CHAOS was motivated by integrating a Lucid Gravity into a previously all-Tesla g
 - **`config.json` contains plaintext credentials** — Lucid account and Powerwall gateway passwords are stored in plaintext. The file is gitignored, but you should also restrict its permissions: `chmod 600 config.json`.
 - **Dashboard has no authentication by default** — Set `dashboard.apiKey` in your config if the dashboard is reachable from outside localhost or a fully trusted network. Without a key, anyone on the network can trigger a poll or switch the active Powerwall.
 - **No HTTPS** — The built-in web server has no TLS. CHAOS is designed for a trusted local network. Never expose port 8087 directly to the internet; if remote access is needed, place it behind a VPN or a reverse proxy with TLS termination.
+- **DNS rebinding** — A malicious website can trick a browser inside your network into sending requests to the dashboard under the attacker's hostname. Set `dashboard.allowedHosts` to the addresses you actually browse to; requests with any other `Host` header are then rejected.
 
 ## Running standalone
 
@@ -183,6 +184,7 @@ Web UI settings.
 | `units` | string | `"imperial"` | Display units. `"imperial"` shows miles; `"metric"` shows kilometres. |
 | `ratedRangeMiles` | number or null | `null` | Rated range of the vehicle in miles, used to display an estimated range alongside SOC. Set to `null` to omit. |
 | `apiKey` | string | `""` | If non-empty, the mutation endpoints (`/api/poll`, `/api/charging`, and `/api/powerwall`) require an `X-API-Key` header matching this value. Read-only endpoints (dashboard state, charts) remain open. Leave empty to disable authentication. |
+| `allowedHosts` | array of strings | `[]` | If non-empty, every request must carry a `Host` header matching one of these entries — list every address users browse to (e.g. `["192.168.1.50", "chaos.local", "localhost"]`). Port numbers are ignored and `*.example.com` wildcards are supported. Requests with any other `Host` header are rejected with `400`, which defends against DNS-rebinding attacks. Leave empty (or omit) to accept any `Host` header. |
 
 ---
 
