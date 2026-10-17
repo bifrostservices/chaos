@@ -15,7 +15,7 @@ CHAOS was motivated by integrating a Lucid Gravity into a previously all-Tesla g
 
 ## Requirements
 
-- Python 3.13 (grpcio wheels are not yet available for 3.14)
+- Python 3.13 or newer (the Docker image uses 3.14)
 - A Tesla Powerwall accessible on the local network using either local API or TEDAPI
 - A Lucid EV on a Lucid account
 - Optional: Tesla vehicle(s) on a Tesla account, for read-only charge-status display

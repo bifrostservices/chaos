@@ -57,7 +57,7 @@ import teslapy
 import uvicorn
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # Directory for runtime-generated files (chaos.log, long-history JSON) so a single
 # Docker bind mount persists all of them across container rebuilds.
