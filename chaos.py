@@ -27,13 +27,20 @@
 
 import asyncio
 import collections
+import contextlib
+import errno
 import itertools
 import json
 import logging
 import pathlib
+import re
 import signal
+import socket
+import sys
+import threading
+import time
 import httpx
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
@@ -46,15 +53,28 @@ from lucidmotors.exceptions import APIError
 import fastapi
 import grpc
 import pygal
+import teslapy
 import uvicorn
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Directory for runtime-generated files (chaos.log, long-history JSON) so a single
 # Docker bind mount persists all of them across container rebuilds.
 _DATA_DIR = pathlib.Path("data")
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Tesla OAuth token cache (teslapy). Holds bearer tokens with full account access —
+# lives in the data dir so the existing Docker bind mount persists it.
+_TESLA_CACHE_FILE = _DATA_DIR / "tesla_token_cache.json"
+_TESLA_POLL_INTERVAL_S_DEFAULT = 300
+_TESLA_CHARGING_POLL_INTERVAL_S = 60   # faster cadence while a Tesla is charging (car is awake — no sleep risk)
+_TESLA_POLL_JITTER_S = 5               # due-time tolerance so a cycle on the nominal boundary never skips the poll
+_TESLA_CHARGING_GRACE_POLLS = 3        # transient non-online reports tolerated while charging (cars don't sleep mid-charge)
+_TESLA_ATTR_WINDOW_S = 150             # max Tesla-data age vs site poll for attribution (tolerates one glitched poll)
+_TESLA_ATTR_HOME_MARGIN_KW = 0.5       # home load must exceed Tesla charging by at least this baseline
+_TESLA_ATTR_SURPLUS_BAND_KW = 0.5      # |surplus| at most this — the charge-on-solar signature
+_MILES_TO_KM = 1.60934
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +85,55 @@ logging.basicConfig(
         logging.FileHandler(_DATA_DIR / "chaos.log"),
     ],
 )
+# The pypowerwall logger is set to DEBUG below so its swallowed failure reasons
+# can be captured; keep those DEBUG records out of stdout and chaos.log.
+for _handler in logging.getLogger().handlers:
+    _handler.setLevel(logging.INFO)
 log = logging.getLogger(__name__)
+
+
+class _PypowerwallErrorCapture(logging.Handler):
+    """Collects pypowerwall's failure messages for the worker thread currently
+    reading a Powerwall. pypowerwall logs network failures (timeouts, connection
+    errors, rate-limit cooldown) only at DEBUG and then returns None, so without
+    this the reason never reaches our log. Records are keyed by thread so
+    concurrent site polls don't mix their messages."""
+
+    _INTERESTING = re.compile(r"error|fail|timeout|unable|rate limit|expired|denied", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.active: dict[int, list[str]] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        messages = self.active.get(record.thread)
+        if messages is None:
+            return
+        message = record.getMessage()
+        if record.levelno >= logging.WARNING or self._INTERESTING.search(message):
+            messages.append(message)
+
+    def runCapturing(self, fn):
+        """Call fn in the current thread; return (fn's result, last captured message or None)."""
+        threadId = threading.get_ident()
+        messages: list[str] = []
+        self.active[threadId] = messages
+        try:
+            return fn(), (messages[-1] if messages else None)
+        finally:
+            self.active.pop(threadId, None)
+
+
+_pypowerwallCapture = _PypowerwallErrorCapture()
+logging.getLogger("pypowerwall").setLevel(logging.DEBUG)
+logging.getLogger("pypowerwall").addHandler(_pypowerwallCapture)
+
+
+class ChargingMode(str, Enum):
+    ENABLED = "enabled"    # normal automatic control
+    MANUAL = "manual"      # CHAOS monitors but never issues charging commands
+    DISABLED = "disabled"  # forces STOP, blocks new sessions
+
 
 # Cable connected but not actively charging — safe to call start_charging()
 CHARGEABLE_STATES = {
@@ -84,6 +152,8 @@ CHARGING_STATES = {
     ChargeState.CHARGE_STATE_AUTHORIZING_PNC,
     ChargeState.CHARGE_STATE_AUTHORIZING_EXTERNAL,
 }
+# Display-name forms of CHARGING_STATES, for checks against _dashboard.chargeStateName
+_CHARGING_STATE_NAMES = {ChargeState.Name(s) for s in CHARGING_STATES}
 
 def _isUnplugged(chargeState: int) -> bool:
     """True when the EV cable is not connected at all (not in any plugged-in state)."""
@@ -114,6 +184,10 @@ _CONNECT_TIMEOUT = 15.0       # Seconds before a Powerwall connection attempt ti
 _SOLAR_ZERO_SUSPECT_W = 200   # Minimum rolling avg (W) that makes a 0W solar reading suspect
 _PW_POLL_RETRY_ATTEMPTS = 2   # Retries after a 0W solar transient before giving up
 _PW_POLL_RETRY_DELAY_S = 2.0  # Seconds between retries
+_SITE_UNREACHABLE_NOTIFY_CYCLES = 5  # Consecutive failed polls (exceptions or all-zero readings) before firing a webhook
+_SITE_RECONNECT_INTERVAL_S = 300  # Min seconds between reconnect attempts for a site that failed to connect at startup
+_PROBE_TIMEOUT_S = 5.0  # Per-layer timeout for the TCP/HTTPS reachability probe run after a failed site poll
+_BOTH_FULL_RESET_MARGIN_PCT = 5   # EV or PW must drop this far below its threshold to re-arm the both-full webhook
 _PW_POLLING_INTERVAL_S = 60   # Powerwall poll cadence (seconds); dark → ×_INTERVAL_DARK
 # After a STOP command, the Lucid API may lag a few cycles before reflecting the stopped state.
 # This window suppresses external-session detection and command re-issue during that lag period.
@@ -165,6 +239,12 @@ def loadConfig(path="config.json"):
         return json.load(f)
 
 
+def _requireStringList(value, message: str) -> None:
+    """Raise RuntimeError(message) unless value is a list of non-empty strings."""
+    if not isinstance(value, list) or not all(isinstance(s, str) and s for s in value):
+        raise RuntimeError(message)
+
+
 def _validateConfig(config: dict) -> None:
     """Validate required config keys and fail fast with a clear error message."""
     def require(obj, keys, context):
@@ -192,10 +272,17 @@ def _validateConfig(config: dict) -> None:
 
     allowedHosts = config.get("dashboard", {}).get("allowedHosts")
     if allowedHosts is not None:
-        if not isinstance(allowedHosts, list) or not all(isinstance(h, str) and h for h in allowedHosts):
-            raise RuntimeError(
-                "config['dashboard']['allowedHosts'] must be a list of non-empty host strings"
-            )
+        _requireStringList(allowedHosts, "config['dashboard']['allowedHosts'] must be a list of non-empty host strings")
+
+    teslaCfg = config.get("tesla")
+    if teslaCfg is not None and teslaCfg.get("enabled", True):
+        require(teslaCfg, ["email"], "config['tesla']")
+        vehicleNames = teslaCfg.get("vehicleNames")
+        if vehicleNames is not None:
+            _requireStringList(vehicleNames, "config['tesla']['vehicleNames'] must be a list of non-empty vehicle names")
+        pollInterval = teslaCfg.get("pollIntervalSeconds")
+        if pollInterval is not None and (isinstance(pollInterval, bool) or not isinstance(pollInterval, (int, float)) or pollInterval <= 0):
+            raise RuntimeError("config['tesla']['pollIntervalSeconds'] must be a positive number")
 
     require(config["lucid"], ["username", "password"], "config['lucid']")
     require(
@@ -204,6 +291,39 @@ def _validateConfig(config: dict) -> None:
          "minChargingAmps", "maxChargingAmps", "commandCooldownMinutes"],
         "config['charging']",
     )
+
+
+def _teslaEnabled(config: dict) -> bool:
+    """True when the optional tesla block is present, enabled, and has an email."""
+    teslaCfg = config.get("tesla")
+    return bool(teslaCfg) and teslaCfg.get("enabled", True) and bool(teslaCfg.get("email"))
+
+
+def _teslaAuthResponseUrl(pasted: str, redirectUri: str, expectedState: str) -> str | None:
+    """Normalize whatever the user pasted — a full redirect URL
+    (tesla://auth/callback?code=...), a bare query string (code=...&state=...),
+    or the code value itself (e.g. from DevTools) — into an authorization
+    response URL. fetch_token must receive authorization_response (not code=):
+    teslapy restarts the whole handshake, regenerating the PKCE verifier the
+    pasted code is bound to, whenever that kwarg is absent."""
+    params = parse_qs(urlparse(pasted).query)
+    if "code" not in params and "://" not in pasted:
+        params = parse_qs(pasted)
+    code = (params.get("code") or [None])[0]
+    if code is None and "://" not in pasted and "=" not in pasted and " " not in pasted and len(pasted) >= 10:
+        code = pasted
+    if code is None:
+        return None
+    state = (params.get("state") or [expectedState])[0]
+    return f"{redirectUri}?{urlencode({'code': code, 'state': state})}"
+
+
+def _ensureTeslaCacheFile() -> None:
+    """Pre-create an empty token cache so teslapy doesn't log a scary traceback
+    on first use (its cache loader warns with exc_info when the file is absent)."""
+    if not _TESLA_CACHE_FILE.exists():
+        _TESLA_CACHE_FILE.write_text("{}")
+        _TESLA_CACHE_FILE.chmod(0o600)
 
 
 def powerwallCacheFile(activeName: str, host: str) -> str:
@@ -223,7 +343,7 @@ class PowerwallState:
     that ``surplusKw`` and ``isDark`` automatically reflect the smoothed value.
     """
 
-    _HISTORY_SIZE = 3
+    _HISTORY_SIZE = 5
 
     def __init__(
         self,
@@ -360,6 +480,7 @@ class DashboardState:
     evChargingAmps: int = 0
     evChargingKw: float = 0.0
     lastError: str | None = None
+    lucidError: str | None = None  # last Lucid poll failure; None after a successful poll
     vehicleName: str = ""
     vehicleModel: str = ""
     vehicleRangeKm: float | None = None   # remaining_range from Lucid proto (km)
@@ -375,7 +496,13 @@ class DashboardState:
     powerwallNames: list[str] = field(default_factory=list)  # all configured Powerwall names
     history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_HISTORY_MAXLEN))
     siteReadings: list = field(default_factory=list)  # per-site Powerwall data for dashboard; see _buildSiteReadings
-    chargingEnabled: bool = True  # user-controlled; False blocks new sessions and stops active ones
+    chargingMode: ChargingMode = ChargingMode.ENABLED  # user-controlled: enabled/manual/disabled
+    teslaConfigured: bool = False  # tesla config block present and enabled → UI shows Tesla section
+    teslaAvailable: bool = True    # False on account-level Tesla auth/API failure
+    teslaError: str | None = None
+    # One dict per Tesla vehicle: vin, name, socPercent, chargeStateName, chargingKw,
+    # rangeKm, chargeLimitPercent, asleep, lastPolled (ISO string — JSON-safe in a list).
+    teslaVehicles: list = field(default_factory=list)
 
 
 _dashboard = DashboardState()
@@ -387,6 +514,7 @@ _NON_ACTIVE_PW_COLOR    = "rgba(255, 240, 100, 0.85)"  # light yellow — matche
 _DASHED_PREFIX          = "╌╌ "                        # legend label prefix indicating a dashed line series
 _DASHED_STYLE           = {"stroke_style": {"dasharray": "8 3", "width": 2.5}}
 _PYGAL_DEFAULT_COLORS   = ("#fbbf24", "#38bdf8", "#4ade80", "#a78bfa")
+_TESLA_CHART_COLORS     = ("#f87171", "#fb923c", "#e879f9", "#facc15")  # one per Tesla vehicle, cycled
 _CHART_NO_DATA = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">'
     b'<text x="50%" y="50%" fill="#64748b" text-anchor="middle" font-family="system-ui">'
@@ -397,7 +525,8 @@ _forcePoll = asyncio.Event()       # /api/poll — trigger an immediate poll cyc
 _switchPowerwall = asyncio.Event() # /api/powerwall — switch the active Powerwall site
 _pendingPowerwallName: str | None = None
 _webApiKey: str = ""  # optional; if non-empty, POST endpoints require X-API-Key header
-_chargingEnabled: bool = True  # user-controlled via POST /api/charging; False blocks and stops charging
+_chargingMode: ChargingMode = ChargingMode.ENABLED  # user-controlled via POST /api/charging
+_webhookUrl: str = ""  # set once in runChaos; read by _pollOneSite for unreachable/recovered notifications
 
 
 @dataclass
@@ -405,11 +534,21 @@ class SiteInfo:
     """Bundles all per-site Powerwall information into one object."""
     name: str
     pw: pypowerwall.Powerwall | None  # None if startup connection failed
+    pwConfig: dict | None = None      # this site's config['powerwalls'] entry, for reconnecting when pw is None
+    lastReconnectAttempt: datetime | None = None  # throttles reconnects while pw is None
     pwState: PowerwallState = field(default_factory=PowerwallState)
     error: str | None = None
     history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_HISTORY_MAXLEN))
     longHistory: collections.deque = field(default_factory=lambda: collections.deque(maxlen=_LONG_HISTORY_MAXLEN))
     lastLongHistoryTime: datetime | None = None
+    model: str | None = None            # gateway model from DIN part number (static; read at connect)
+    firmwareVersion: str | None = None  # gateway firmware version (static; read at connect)
+    lifetimeChargedWh: float | None = None     # battery meter energy_imported (lifetime, Wh)
+    lifetimeDischargedWh: float | None = None  # battery meter energy_exported (lifetime, Wh)
+    consecutiveFailures: int = 0     # consecutive failed polls (exceptions or all-zero readings, not solar transients)
+    firstFailureTime: datetime | None = None  # when the current run of failed polls began; None while healthy
+    unreachableNotified: bool = False  # True once the unreachable webhook has fired, until recovery
+    bothFullNotified: bool = False  # True once the EV-at-target + PW-full webhook has fired, until either drops past the reset margin
 
 
 def _rawSurplusKw(solarWatts: float, homeWatts: float) -> float:
@@ -431,8 +570,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .card{background:#1e293b;border-radius:10px;padding:14px 18px;min-width:130px;border:1px solid #334155}
   .card-label{font-size:.7em;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em}
   .card-value{font-size:1.5em;font-weight:600;margin-top:4px;color:#f1f5f9}
-  .card-sub{font-size:.7em;color:#4ade80;margin-top:2px}
   .card-group-label{font-size:.65em;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 6px}
+  .card-group-label .glmeta{text-transform:none;letter-spacing:0;font-weight:400;color:#64748b;margin-left:8px}
+  .card-group-label .glerr{color:#f87171}
+  .card-group-label .glname{color:#f1f5f9;font-weight:600}
+  .card-group-label .glerr .glname{color:inherit}
+  .devices{display:grid;grid-template-columns:1fr;column-gap:24px;align-items:start}
+  @media(min-width:1350px){
+    .devices{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .devices .device:only-child{grid-column:1/-1}
+  }
   .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8em;font-weight:600}
   .g{background:#166534;color:#bbf7d0}.s{background:#374151;color:#9ca3af}
   .error-bar{background:#7f1d1d;color:#fca5a5;padding:10px 16px;border-radius:8px;margin-bottom:16px;font-size:.85em}
@@ -442,10 +589,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   td{padding:7px 10px;border-bottom:1px solid #0f172a}
   tr:last-child td{border-bottom:none}
   .pos{color:#4ade80}.neg{color:#f87171}.muted{color:#94a3b8}
-  .vehicle-info{color:#cbd5e1;font-size:.85em;margin-bottom:16px;min-height:1.2em}
-  .vehicle-info .vname{font-weight:600;color:#f1f5f9}
-  .vehicle-info .vsep{color:#475569;margin:0 6px}
-  .vehicle-info .vmuted{color:#64748b;font-size:.9em}
   .footer{margin-top:24px;color:#334155;font-size:.72em;text-align:right}
   .hi{color:#fbbf24}
   .poll-btn{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:4px 12px;font-size:.8em;cursor:pointer;margin-left:10px;vertical-align:middle}
@@ -455,6 +598,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .toggle-btn{background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:4px 12px;font-size:.8em;cursor:pointer}
   .toggle-btn:hover:not(.toggle-active){background:#334155;color:#e2e8f0}
   .toggle-btn.toggle-enable.toggle-active{background:#14532d;color:#86efac;border-color:#166534;cursor:default}
+  .toggle-btn.toggle-manual.toggle-active{background:#78350f;color:#fbbf24;border-color:#92400e;cursor:default}
   .toggle-btn.toggle-disable.toggle-active{background:#450a0a;color:#fca5a5;border-color:#7f1d1d;cursor:default}
   .chart-section{margin-bottom:24px}
   .chart-section h2{margin-bottom:8px}
@@ -472,23 +616,27 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <h1>⚡ <abbr title="CHarging Automatically On Solar">CHAOS</abbr></h1>
 <div>
 <div class="charging-toggle">
-  <button class="toggle-btn toggle-enable" id="btnEnable" onclick="setCharging(true)">Enable Charging</button>
-  <button class="toggle-btn toggle-disable" id="btnDisable" onclick="setCharging(false)">Disable Charging</button>
+  <button class="toggle-btn toggle-enable" id="btnEnable" onclick="setChargingMode('enabled')" title="Controls CHAOS's Lucid charging only — Tesla vehicles are read-only">Enable Lucid Charging</button>
+  <button class="toggle-btn toggle-manual" id="btnManual" onclick="setChargingMode('manual')" title="CHAOS keeps monitoring but sends no charging commands">Manual (Monitor Only)</button>
+  <button class="toggle-btn toggle-disable" id="btnDisable" onclick="setChargingMode('disabled')" title="Controls CHAOS's Lucid charging only — Tesla vehicles are read-only">Disable Lucid Charging</button>
 </div>
 <button class="poll-btn" id="pollBtn" onclick="forcePoll()">Update now</button>
 </div>
 </div>
 <div class="tagline"><span class="hi">CH</span>arging <span class="hi">A</span>utomatically <span class="hi">O</span>n <span class="hi">S</span>olar</div>
 <div class="subtitle" id="sub">Loading…</div>
-<div class="vehicle-info" id="vinfo"></div>
 <div id="err" class="error-bar" style="display:none"></div>
-<div id="siteRows"></div>
-<div class="card-group-label">Electric Vehicle</div>
+<div id="siteRows" class="devices"></div>
+<div id="vehiclesSection" class="devices">
+<div class="device">
+<div class="card-group-label" id="evLabel">Lucid</div>
 <div class="cards">
-  <div class="card" id="card-ev"><div class="card-label">EV Battery</div><div class="card-value" id="ev">—</div></div>
+  <div class="card" id="card-ev"><div class="card-label">Battery</div><div class="card-value" id="ev">—</div></div>
   <div class="card" id="card-range"><div class="card-label">Range</div><div class="card-value" id="range">—</div></div>
   <div class="card"><div class="card-label">Charge State</div><div class="card-value" id="cs">—</div></div>
-  <div class="card"><div class="card-label">Charging</div><div class="card-value" id="amps">—</div></div>
+  <div class="card"><div class="card-label">Charging</div><div class="card-value" id="chargingKw">—</div></div>
+</div>
+</div>
 </div>
 <h2>History</h2>
 <div class="chart-section">
@@ -501,9 +649,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <th>Time</th><th>Solar</th><th>Home</th><th>Surplus</th><th>PW%</th><th>EV%</th><th>State</th><th>Amps</th><th>Action</th>
 </tr></thead><tbody id="hist"></tbody></table>
 <script>
+const MI=1.60934;
 function badge(s){
   if(!s||s==='unknown')return '<span class="badge s">—</span>';
-  const n=s.replace('CHARGE_STATE_','').replace(/_/g,' ');
+  const n=escHtml(s.replace('CHARGE_STATE_','').replace(/_/g,' '));
   const cls=(!s.includes('STOPPED')&&!s.includes('END')&&!s.includes('PAUSED')&&s.includes('CHARG'))?'g':'s';
   return '<span class="badge '+cls+'">'+n+'</span>';
 }
@@ -545,9 +694,10 @@ function refresh(){
     const imperial=d.units!=='metric';
     const ts=d.lastUpdated?new Date(d.lastUpdated).toLocaleString():'Never';
     if(d.version)document.getElementById('ver').textContent='CHAOS v'+d.version;
-    const enabled=d.chargingEnabled!==false;
-    document.getElementById('btnEnable').classList.toggle('toggle-active',enabled);
-    document.getElementById('btnDisable').classList.toggle('toggle-active',!enabled);
+    const mode=d.chargingMode||'enabled';
+    document.getElementById('btnEnable').classList.toggle('toggle-active',mode==='enabled');
+    document.getElementById('btnManual').classList.toggle('toggle-active',mode==='manual');
+    document.getElementById('btnDisable').classList.toggle('toggle-active',mode==='disabled');
 
     // Live countdown to next poll — update every second
     if(window._countdownTimer)clearInterval(window._countdownTimer);
@@ -566,19 +716,21 @@ function refresh(){
     // Schedule next UI fetch to coincide with the next backend poll (+2s buffer)
     const delay=window._nextPollAt?Math.max(1000,window._nextPollAt-Date.now()+2000):65000;
     setTimeout(refresh,delay);
-    const vi=document.getElementById('vinfo');
-    if(d.vehicleName||d.vehicleModel){
-      const age=ageFmt(d.vehicleLastPolled);
-      const odo=d.vehicleOdometerKm!=null?(imperial?Math.round(d.vehicleOdometerKm/1.60934).toLocaleString()+' mi':Math.round(d.vehicleOdometerKm).toLocaleString()+' km'):null;
-      const fw=d.vehicleSoftwareVersion?'fw '+d.vehicleSoftwareVersion:null;
-      let html=(d.vehicleName?'<span class="vname">'+escHtml(d.vehicleName)+'</span>':'');
-      if(d.vehicleName&&d.vehicleModel)html+='<span class="vsep">·</span>';
-      if(d.vehicleModel)html+=escHtml(d.vehicleModel);
-      if(odo)html+='<span class="vsep">·</span><span class="vmuted">'+odo+'</span>';
-      if(fw)html+='<span class="vsep">·</span><span class="vmuted">fw '+escHtml(d.vehicleSoftwareVersion)+'</span>';
-      if(age)html+='<span class="vsep">·</span><span class="vmuted">EV data: '+age+'</span>';
-      vi.innerHTML=html;
+    // Group-header label: base (pre-escaped HTML) turns red with a tooltip on
+    // fetch failure; meta is a muted, non-uppercased suffix.
+    function glabel(base,err,meta){
+      let h=err?'<span class="glerr" title="'+escHtml(err).replace(/"/g,'&quot;')+'">'+base+'</span>':base;
+      if(meta)h+='<span class="glmeta">· '+meta+'</span>';
+      return h;
     }
+    // Device header meta: identity (model · odometer · firmware) + optional extra + freshness
+    const odoFmt=km=>imperial?Math.round(km/MI).toLocaleString()+' mi':Math.round(km).toLocaleString()+' km';
+    const mwhFmt=wh=>wh<1e6?Math.round(wh/1e3)+' kWh':(wh/1e6).toFixed(1)+' MWh';
+    function vmeta(model,odoKm,fw,fresh,extra){
+      return [model?escHtml(model):null,odoKm!=null?odoFmt(odoKm):null,fw?'fw '+escHtml(fw):null,extra,fresh].filter(Boolean).join(' · ');
+    }
+    // Vehicle header label: bright vehicle name first, then the manufacturer
+    function vlabel(name,make){return (name?'<span class="glname">'+escHtml(name)+'</span> · ':'')+make;}
 
     // Build one row per Powerwall site
     const siteRows=document.getElementById('siteRows');
@@ -589,30 +741,72 @@ function refresh(){
       const btnHtml=multiSite
         ?'<button class="activate-btn'+(isActive?' active':'')+'" data-name="'+escHtml(site.name)+'"'+(isActive?' disabled':'')+' onclick="switchPowerwall(this.dataset.name)">'+(isActive?'Active ✓':'Use for charging')+'</button>'
         :'';
+      const life=[site.lifetimeChargedWh!=null?mwhFmt(site.lifetimeChargedWh)+' in':null,
+                  site.lifetimeDischargedWh!=null?mwhFmt(site.lifetimeDischargedWh)+' out':null].filter(Boolean).join(' · ');
       const hdr='<div class="site-row-header">'
-        +'<span class="card-group-label" style="margin:0">'+escHtml(site.name)+'</span>'
+        +'<span class="card-group-label" style="margin:0">'+glabel('<span class="glname">'+escHtml(site.name)+'</span>',site.error,vmeta(site.model,null,site.firmwareVersion,site.lastPolled?'polled '+ageFmt(site.lastPolled):null,life||null))+'</span>'
         +btnHtml+'</div>';
       const errHtml=site.error?'<div class="site-row-error">⚠ '+escHtml(site.error)+'</div>':'';
       const cardId='card-pw-'+site.name.replace(/\\s+/g,'_');
+      // Home load minus whichever EV draw is attributed to this site: Lucid on the
+      // active site, else backend-attributed Tesla charging (mutually exclusive).
+      const tKw=site.teslaChargingKw||0;
+      let homeW=site.homeWatts;
+      if(isActive&&d.evChargingKw>0){if(d.evChargingKw*1000<homeW)homeW-=d.evChargingKw*1000;}
+      else if(tKw>0&&tKw*1000<homeW)homeW-=tKw*1000;
       const cards='<div class="cards">'
-        +'<div class="card"><div class="card-label">Solar</div><div class="card-value">'+kwFmt(site.solarWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(isActive?(d.evChargingKw*1000<site.homeWatts?site.homeWatts-d.evChargingKw*1000:site.homeWatts):site.homeWatts)+'</div></div>'
-        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(site.surplusKw)+'</div></div>'
         +'<div class="card" id="'+cardId+'"><div class="card-label">Powerwall</div><div class="card-value">'+(site.powerwallSocPercent!=null?site.powerwallSocPercent.toFixed(1)+'%':'—')+'</div></div>'
-        +(isActive&&d.evChargingKw>0?'<div class="card"><div class="card-label">EV Charging</div><div class="card-value">'+kwFmt(d.evChargingKw*1000)+'</div></div>':'')
+        +'<div class="card"><div class="card-label">Solar</div><div class="card-value">'+kwFmt(site.solarWatts)+'</div></div>'
+        +'<div class="card"><div class="card-label">Home Load</div><div class="card-value">'+kwFmt(homeW)+'</div></div>'
+        +'<div class="card"><div class="card-label">Surplus</div><div class="card-value">'+surpFmt(site.surplusKw)+'</div></div>'
+        +(isActive&&d.evChargingKw>0?'<div class="card"><div class="card-label">Lucid Charging</div><div class="card-value">'+kwFmt(d.evChargingKw*1000)+'</div></div>':'')
+        +(tKw>0?'<div class="card"><div class="card-label">Tesla Charging</div><div class="card-value">'+kwFmt(tKw*1000)+'</div></div>':'')
         +'</div>';
-      siteRows.insertAdjacentHTML('beforeend',hdr+errHtml+cards);
+      siteRows.insertAdjacentHTML('beforeend','<div class="device">'+hdr+errHtml+cards+'</div>');
       fillBg(cardId,site.powerwallSocPercent,'rgba(56,189,248,0.22)');
     });
 
+    const lage=ageFmt(d.vehicleLastPolled);
+    document.getElementById('evLabel').innerHTML=glabel(vlabel(d.vehicleName,'Lucid'),d.lucidError,
+      vmeta(d.vehicleModel,d.vehicleOdometerKm,d.vehicleSoftwareVersion,lage?'data: '+lage:null));
     document.getElementById('ev').textContent=d.evSocPercent!=null?d.evSocPercent+'%':'—';
-    const rangeFmt=d.vehicleRangeKm!=null?(imperial?Math.round(d.vehicleRangeKm/1.60934)+' mi':Math.round(d.vehicleRangeKm)+' km'):'—';
+    const rangeFmt=d.vehicleRangeKm!=null?(imperial?Math.round(d.vehicleRangeKm/MI)+' mi':Math.round(d.vehicleRangeKm)+' km'):'—';
     document.getElementById('range').textContent=rangeFmt;
     document.getElementById('cs').innerHTML=badge(d.chargeStateName);
-    document.getElementById('amps').textContent=d.evChargingAmps>0?d.evChargingAmps+'A':'—';
+    document.getElementById('chargingKw').textContent=d.evChargingKw>0?d.evChargingKw.toFixed(1)+' kW':'—';
     fillBg('card-ev',d.evSocPercent,'rgba(74,222,128,0.22)',d.targetEvChargePercent);
     if(d.ratedRangeMiles!=null&&d.vehicleRangeKm!=null)
-      fillBg('card-range',d.vehicleRangeKm/(d.ratedRangeMiles*1.60934)*100,'rgba(251,191,36,0.22)');
+      fillBg('card-range',d.vehicleRangeKm/(d.ratedRangeMiles*MI)*100,'rgba(251,191,36,0.22)');
+
+    // Tesla vehicles (read-only) — one card group per vehicle, built dynamically and
+    // appended alongside the static Lucid tile so both can share a grid row when they fit
+    const tsec=document.getElementById('vehiclesSection');
+    tsec.querySelectorAll('.tesla-device').forEach(el=>el.remove());
+    if(d.teslaConfigured){
+      let th='';
+      (d.teslaVehicles||[]).forEach((v,i)=>{
+        const age=ageFmt(v.lastPolled);
+        const fresh=v.asleep?'💤 asleep'+(age?' · '+age:''):(age?'data: '+age:null);
+        th+='<div class="device tesla-device">'
+          +'<div class="card-group-label">'+glabel(vlabel(v.name,'Tesla'),d.teslaAvailable?null:(d.teslaError||'Tesla unavailable'),vmeta(v.model,v.odometerKm,v.softwareVersion,fresh))+'</div>'
+          +'<div class="cards">'
+          +'<div class="card" id="card-tesla-'+i+'"><div class="card-label">Battery</div><div class="card-value">'+(v.socPercent!=null?v.socPercent+'%':'—')+'</div></div>'
+          +'<div class="card" id="card-tesla-range-'+i+'"><div class="card-label">Range</div><div class="card-value">'+(v.rangeKm!=null?(imperial?Math.round(v.rangeKm/MI)+' mi':Math.round(v.rangeKm)+' km'):'—')+'</div></div>'
+          +'<div class="card"><div class="card-label">Charge State</div><div class="card-value">'+badge((v.chargeStateName||'').toUpperCase())+'</div></div>'
+          +'<div class="card"><div class="card-label">Charging</div><div class="card-value">'+(v.chargingKw>0?v.chargingKw.toFixed(1)+' kW':'—')+'</div></div>'
+          +'</div></div>';
+      });
+      // Unavailable before any vehicle was ever seen: no per-vehicle headers exist
+      // to carry the red state, so show one section-level header instead.
+      if(!th&&!d.teslaAvailable)th='<div class="device tesla-device"><div class="card-group-label">'+glabel('Tesla',d.teslaError||'Tesla unavailable',null)+'</div></div>';
+      tsec.insertAdjacentHTML('beforeend',th);
+      (d.teslaVehicles||[]).forEach((v,i)=>{
+        fillBg('card-tesla-'+i,v.socPercent,'rgba(248,113,113,0.22)',v.chargeLimitPercent);
+        // Range as a fraction of a full charge equals SOC (range/rangeAt100%) — same
+        // amber treatment as the Lucid range card.
+        if(v.socPercent!=null)fillBg('card-tesla-range-'+i,v.socPercent,'rgba(251,191,36,0.22)');
+      });
+    }
     const eb=document.getElementById('err');
     if(d.lastError){eb.style.display='';eb.textContent='⚠ '+d.lastError;}
     else eb.style.display='none';
@@ -641,8 +835,8 @@ function refresh(){
     });
   }).catch(()=>{ setTimeout(refresh,65000); });
 }
-function setCharging(enabled){
-  fetch('/api/charging',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'__CHAOS_API_KEY__'},body:JSON.stringify({enabled:enabled})})
+function setChargingMode(mode){
+  fetch('/api/charging',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':'__CHAOS_API_KEY__'},body:JSON.stringify({mode:mode})})
     .then(()=>{setTimeout(refresh,500);setTimeout(refresh,5000);});
 }
 function forcePoll(){
@@ -788,22 +982,30 @@ async def _webApiPoll(_: None = fastapi.Depends(_checkApiKey)):
     _forcePoll.set()
     return {"status": "ok"}
 
+_CHARGING_MODE_DESC = {
+    ChargingMode.ENABLED:  "charging enabled",
+    ChargingMode.MANUAL:   "charging set to manual (monitor only)",
+    ChargingMode.DISABLED: "charging disabled",
+}
+
 @_webApp.post("/api/charging")
 async def _webApiSetCharging(body: dict, _: None = fastapi.Depends(_checkApiKey)):
-    global _chargingEnabled
-    enabled = body.get("enabled")
-    if not isinstance(enabled, bool):
-        raise fastapi.HTTPException(status_code=400, detail="'enabled' must be a boolean")
-    if enabled != _chargingEnabled:
-        _chargingEnabled = enabled
-        _dashboard.chargingEnabled = enabled
-        desc = "charging enabled" if enabled else "charging disabled"
-        log.info("Charging %s by user", "enabled" if enabled else "disabled")
+    global _chargingMode
+    try:
+        mode = ChargingMode(body.get("mode"))
+    except ValueError:
+        raise fastapi.HTTPException(status_code=400, detail="'mode' must be one of: enabled, manual, disabled")
+    if mode != _chargingMode:
+        _chargingMode = mode
+        _dashboard.chargingMode = mode
+        desc = _CHARGING_MODE_DESC[mode]
+        log.info("Charging mode set to %s by user", mode.value)
         if _dashboard.history:
             prev = _dashboard.history[-1].get("action", "")
             _dashboard.history[-1]["action"] = desc + (" • " + prev if prev else "")
+        await asyncio.to_thread(_writeChargingModeToConfig, mode)
         _forcePoll.set()  # apply immediately
-    return {"ok": True, "chargingEnabled": _chargingEnabled}
+    return {"ok": True, "chargingMode": _chargingMode}
 
 @_webApp.post("/api/powerwall")
 async def _webApiSwitchPowerwall(body: dict, _: None = fastapi.Depends(_checkApiKey)):
@@ -829,7 +1031,7 @@ async def _webChartPower():
     datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
         ("Solar",       [round(h["solarWatts"] / 1000, 2) for h in active_hist]),
         ("Home Load",   [round(max(0.0, h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
-        ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
+        ("Lucid Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
         pad = _paddedSiteHistory(site.longHistory, n)
@@ -856,7 +1058,7 @@ async def _webChartPowerHour():
     datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
         ("Solar",       [round(h["solarWatts"] / 1000, 2) for h in active_hist]),
         ("Home Load",   [round(max(0.0, h["homeWatts"] - (h.get("evChargingKw") or 0) * 1000) / 1000, 2) for h in active_hist]),
-        ("EV Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
+        ("Lucid Charging", [h.get("evChargingKw", 0) or 0     for h in active_hist]),
     ]
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
         pad = _paddedSiteHistory(site.history, n)
@@ -875,8 +1077,18 @@ async def _webChartSoc():
     n = len(active_hist)
     datasets: list[tuple[str, list, dict] | tuple[str, list]] = [
         ("Powerwall", [h["powerwallSocPercent"] for h in active_hist]),
-        ("EV Battery", [h.get("evSocPercent") for h in active_hist]),
+        ("Lucid", [h.get("evSocPercent") for h in active_hist]),
     ]
+    colors = ["#38bdf8", "#4ade80"]  # sky=Powerwall, green=EV (matches power chart)
+    # One series per Tesla vehicle seen in history (ordered by first appearance).
+    # Keys are VINs (stable across renames); label with the current name, falling
+    # back to the key itself so legacy name-keyed entries and removed vehicles
+    # still render.
+    teslaKeys = list(dict.fromkeys(key for h in active_hist for key in (h.get("teslaSoc") or ())))
+    teslaNames = {v["vin"]: v["name"] for v in _dashboard.teslaVehicles}
+    for key, color in zip(teslaKeys, itertools.cycle(_TESLA_CHART_COLORS)):
+        datasets.append((teslaNames.get(key, key), [soc.get(key) if (soc := h.get("teslaSoc")) else None for h in active_hist]))
+        colors.append(color)
     for siteName, site in ((sn, s) for sn, s in _allSites.items() if sn != active):
         pad = _paddedSiteHistory(site.longHistory, n)
         datasets.append((f"{_DASHED_PREFIX}{siteName} PW", [h["powerwallSocPercent"] if h else None for h in pad], {**_DASHED_STYLE, "color": _NON_ACTIVE_PW_COLOR}))
@@ -885,7 +1097,7 @@ async def _webChartSoc():
         datasets,
         labels,
         y_range=(0, 100),
-        colors=("#38bdf8", "#4ade80"),  # sky=Powerwall, green=EV (matches power chart)
+        colors=tuple(colors),
     )
     return fastapi.Response(content=svg, media_type="image/svg+xml")
 
@@ -964,15 +1176,18 @@ def _decideChargingAction(
     effectiveSurplusKw: float,
     evSocPercent: float,
     externalSession: bool = False,  # True when car was found charging without CHAOS having started it
-    chargingEnabled: bool = True,   # False blocks new sessions and stops any active one
+    chargingMode: ChargingMode = ChargingMode.ENABLED,  # DISABLED blocks/stops; MANUAL monitors only
     lowSurplusCycles: int = 0,      # consecutive cycles of insufficient surplus while charging (stop-confirm guard)
 ) -> ChargingDecision:
     """Pure function: given current state, return the charging action to take.
     Contains no I/O — fully unit-testable without mocking Lucid or Powerwall."""
-    if not chargingEnabled:
+    if chargingMode == ChargingMode.DISABLED:
         if isCharging:
             return ChargingDecision(ChargingAction.STOP, 0, "charging disabled by user")
         return ChargingDecision(ChargingAction.NONE, prevEvChargingAmps, "charging disabled")
+
+    if chargingMode == ChargingMode.MANUAL:
+        return ChargingDecision(ChargingAction.NONE, prevEvChargingAmps, "manual mode — observing only")
 
     if isCharging:
         if externalSession and not thresholds.allowExternalChargeInterference:
@@ -980,6 +1195,12 @@ def _decideChargingAction(
                 ChargingAction.OBSERVE,
                 prevEvChargingAmps,
                 "externally-started charge — not interfering",
+            )
+        if externalSession and inCooldown and not lastCommandWasStart:
+            return ChargingDecision(
+                ChargingAction.OBSERVE,
+                prevEvChargingAmps,
+                f"externally-started charge — deferring takeover, within stop cooldown ({cooldownRemainingDesc} remaining)",
             )
         if targetAmps < thresholds.minChargingAmps:
             if inCooldown and lastCommandWasStart:
@@ -1085,10 +1306,16 @@ async def pollVehicleAndDecide(
         )
 
     externalSession = isCharging and prevEvChargingAmps == 0
+    externalSessionDesc = ""
     if externalSession:
         actualAmps = vehicle.state.charging.active_session_ac_current_limit or 0
-        action_desc = "taking over" if thresholds.allowExternalChargeInterference else "observing"
-        log.info(f"External charge session detected at {actualAmps}A — {action_desc}")
+        if not thresholds.allowExternalChargeInterference:
+            externalSessionDesc = "observing"
+        elif inCooldown and not lastCommandWasStart:
+            externalSessionDesc = "observing (stop cooldown)"
+        else:
+            externalSessionDesc = "taking over"
+        log.info(f"External charge session detected at {actualAmps}A — {externalSessionDesc}")
         prevEvChargingAmps = actualAmps
 
     # Cancel out the EV's own load from homeWatts so surplus reflects only household load.
@@ -1117,7 +1344,7 @@ async def pollVehicleAndDecide(
         thresholds, inCooldown, lastCommandWasStart, cooldownRemainingDesc,
         pwState, effectiveSurplusKw, evSocPercent,
         externalSession=externalSession,
-        chargingEnabled=_chargingEnabled,
+        chargingMode=_chargingMode,
         lowSurplusCycles=prevLowSurplusCycles,
     )
 
@@ -1220,9 +1447,9 @@ async def pollVehicleAndDecide(
             pwState.resetHomeHistory()   # home load dropped; stale readings now skew avg
         evChargingAmps = 0
 
-    actionDesc = decision.reason if decision.action in (ChargingAction.ADJUST, ChargingAction.HOLD_STOP) else _ACTION_DESC.get(decision.action, "")
+    actionDesc = decision.reason if decision.action in (ChargingAction.NONE, ChargingAction.ADJUST, ChargingAction.HOLD_STOP) else _ACTION_DESC.get(decision.action, "")
     if externalSession:
-        actionDesc = f"ext session — {action_desc}"
+        actionDesc = f"ext session — {externalSessionDesc}"
     return VehicleState(evSocPercent=evSocPercent, chargeState=chargeState, evChargingAmps=evChargingAmps, lastCommandTime=lastCommandTime, lastCommandWasStart=lastCommandWasStart, lastActionDesc=actionDesc, lowSurplusCycles=newLowSurplusCycles)
 
 
@@ -1248,7 +1475,7 @@ def _updateDashboard(
     with EV-specific fields and updates the dashboard EV card fields.
     """
     dashState.lastUpdated = datetime.now(timezone.utc)
-    dashState.chargingEnabled = _chargingEnabled
+    dashState.chargingMode = _chargingMode
     if cachedState is not None:
         dashState.evSocPercent = round(cachedState.evSocPercent, 1)
         dashState.chargeStateName = _chargeStateName(cachedState.chargeState)
@@ -1350,11 +1577,15 @@ async def processCycle(
             await _lucidLoginWithRetry(lucid, lucidConfig)
 
     # --- Decide whether to poll Lucid ---
-    # Always poll if currently charging (may need to stop), on first cycle, or forced by user.
-    # Otherwise skip if the outcome is predetermined.
+    # Always poll if currently charging (may need to stop), on first cycle, forced by
+    # user, or while charging is disabled — CHAOS must keep checking for an
+    # externally-started session it needs to stop; the outcome is only "predetermined"
+    # (safe to skip) for the surplus/SoC/dark conditions below, which are about whether
+    # CHAOS would additionally choose to *start* a charge. Manual mode never stops
+    # anything, so it uses the same skip cadence as normal enabled operation.
     isActivelyCharging = cachedState is not None and cachedState.chargeState in CHARGING_STATES
     skipReason = None
-    if not isActivelyCharging and not forceEvPoll:
+    if not isActivelyCharging and not forceEvPoll and _chargingMode != ChargingMode.DISABLED:
         if pwState.isDark:
             skipReason = "dark"
             pollIntervalFactor = _INTERVAL_DARK
@@ -1365,9 +1596,6 @@ async def processCycle(
             pollIntervalFactor = _INTERVAL_PW_LOW
         elif cachedState is not None and cachedState.evSocPercent >= thresholds.targetEvChargePercent:
             skipReason = "EV at target"
-            pollIntervalFactor = _INTERVAL_EV_DONE
-        elif not _chargingEnabled:
-            skipReason = "charging disabled"
             pollIntervalFactor = _INTERVAL_EV_DONE
 
     if skipReason:
@@ -1393,6 +1621,48 @@ async def processCycle(
         _updateDashboard(dashState, cachedState, thresholds, skipReason)
 
     return cachedState, pollIntervalFactor
+
+
+# Battery PackagePartNumber prefix → model name. NOTE: the gateway's DIN is NOT
+# usable here — it identifies the Backup Gateway (e.g. 1232100 = Gateway 2), not
+# the batteries. Unknown prefixes are logged and show no model.
+_PW_BATTERY_MODELS = {
+    "1092170": "Powerwall 2",
+    "2012170": "Powerwall 2",
+    "3012170": "Powerwall 2",
+    "1850000": "Powerwall+",
+    "2850000": "Powerwall+",
+    "1707000": "Powerwall 3",
+}
+
+
+def _readPowerwallInfo(pw) -> tuple[str | None, str | None]:
+    """Best-effort static site info: (battery model summary, gateway firmware version).
+    Synchronous pypowerwall calls — run inside asyncio.to_thread. Never raises."""
+    model = version = None
+    try:
+        blocks = (pw.system_status() or {}).get("battery_blocks") or []
+        names = []
+        for block in blocks:
+            part = (block.get("PackagePartNumber") or "").split("-")[0]
+            name = _PW_BATTERY_MODELS.get(part)
+            if name:
+                names.append(name)
+            elif part:
+                log.info(f"[Powerwall] Unknown battery part number '{block.get('PackagePartNumber')}' — please report")
+        if names:
+            unique = list(dict.fromkeys(names))
+            if len(unique) > 1:
+                model = " + ".join(unique)  # mixed installation
+            else:
+                model = unique[0] if len(names) == 1 else f"{len(names)}× {unique[0]}"
+    except Exception as e:
+        log.debug(f"[Powerwall] Battery info read failed: {e}")
+    try:
+        version = (pw.version() or "").split(" ")[0] or None  # strip the build hash
+    except Exception as e:
+        log.debug(f"[Powerwall] Version read failed: {e}")
+    return model, version
 
 
 async def _connectPowerwall(pwConfig: dict, name: str) -> pypowerwall.Powerwall:
@@ -1470,8 +1740,120 @@ def _writePowerwallToConfig(newName: str, path: str = "config.json") -> None:
         log.warning(f"Failed to write activePowerwall to config: {e}")
 
 
+def _writeChargingModeToConfig(mode: ChargingMode, path: str = "config.json") -> None:
+    """Persist the user's charging mode so it survives a process restart
+    (otherwise a restart while charging is disabled/manual silently re-enables it)."""
+    try:
+        p = pathlib.Path(path)
+        data = json.loads(p.read_text())
+        data.setdefault("charging", {})["chargingMode"] = mode.value
+        p.write_text(json.dumps(data, indent=2))
+        log.info(f"Updated config.json: charging.chargingMode = {mode.value}")
+    except Exception as e:
+        log.warning(f"Failed to write chargingMode to config: {e}")
+
+
+def _freshTeslaChargingKw(site: "SiteInfo") -> float:
+    """Summed charging power of awake Teslas whose data aligns with this site's
+    last poll within _TESLA_ATTR_WINDOW_S. 0.0 when none, stale, or malformed
+    (display-only heuristic — must never break the poll loop)."""
+    if not _dashboard.teslaConfigured or not site.history:
+        return 0.0
+    try:
+        sitePolled = datetime.fromisoformat(site.history[-1]["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    total = 0.0
+    for v in _dashboard.teslaVehicles:
+        if v["asleep"] or not v["lastPolled"] or not v["chargingKw"] or v["chargingKw"] <= 0:
+            continue
+        try:
+            fresh = abs((datetime.fromisoformat(v["lastPolled"]) - sitePolled).total_seconds()) <= _TESLA_ATTR_WINDOW_S
+        except (TypeError, ValueError):
+            continue
+        if fresh:
+            total += v["chargingKw"]
+    return total
+
+
+def _lucidChargingHere(isActive: bool) -> bool:
+    """True when this site is being used for Lucid charging: commanded/external
+    amps, or the API still reports a charging state during the stop-lag window."""
+    return isActive and (_dashboard.evChargingKw > 0 or _dashboard.chargeStateName in _CHARGING_STATE_NAMES)
+
+
+def _siteTeslaCandidateKw(site: "SiteInfo", isActive: bool) -> float:
+    """Tesla charging power this site COULD be hosting (attribution ENTRY check).
+
+    A Tesla charging via its own Charge-on-Solar hides inside Home Load while
+    holding surplus near zero. A site is a candidate when the fresh charging
+    total plausibly fits its readings and the site isn't busy Lucid-charging.
+    0.0 when any condition fails. Callers pick at most ONE candidate site and
+    then HOLD it for the session (see _attributedTeslaSite) — these strict
+    conditions identify where charging started, not whether it continues."""
+    if _lucidChargingHere(isActive):
+        return 0.0
+    total = _freshTeslaChargingKw(site)
+    if total <= 0:
+        return 0.0
+    if site.pwState.homeWatts / 1000 < total + _TESLA_ATTR_HOME_MARGIN_KW:
+        return 0.0  # home load can't plausibly contain the draw plus a baseline
+    if abs(_rawSurplusKw(site.pwState.solarWatts, site.pwState.homeWatts)) > _TESLA_ATTR_SURPLUS_BAND_KW:
+        return 0.0  # missing the near-zero-surplus charge-on-solar signature
+    return total
+
+
+def _teslaPollDelayS(teslaPollIntervalS: float) -> float:
+    """Tesla poll delay: site cadence while any Tesla is awake and charging
+    (keeps charging attribution fresh), else the configured interval."""
+    if any(not v["asleep"] and (v["chargingKw"] or 0) > 0 for v in _dashboard.teslaVehicles):
+        return min(_TESLA_CHARGING_POLL_INTERVAL_S, teslaPollIntervalS)
+    return teslaPollIntervalS
+
+
+_teslaAttrSiteName: str | None = None  # site currently holding Tesla-charging attribution
+
+
+def _attributedTeslaSite(allSites: dict, activeName: str) -> tuple[str | None, float]:
+    """Pick at most ONE site to attribute Tesla charging to (a Tesla can only be
+    in one place), with session hysteresis: strict signature conditions gate
+    ENTRY, but once attributed the site HOLDS the attribution until the Tesla
+    actually stops charging (or data goes stale / the Lucid takes the site) —
+    household transients like appliance spikes must not drop a live session."""
+    global _teslaAttrSiteName
+    if _teslaAttrSiteName is not None:
+        site = allSites.get(_teslaAttrSiteName)
+        holdKw = _freshTeslaChargingKw(site) if site is not None else 0.0
+        if site is None:
+            reason = "site no longer exists"
+        elif holdKw <= 0:
+            reason = "no fresh charging data"
+        elif _lucidChargingHere(_teslaAttrSiteName == activeName):
+            reason = "Lucid charging on site"
+        elif site.pwState.homeWatts / 1000 < holdKw:
+            reason = "home load below Tesla draw"
+        else:
+            return _teslaAttrSiteName, holdKw
+        log.info(f"[Tesla] Releasing charging attribution from site '{_teslaAttrSiteName}' ({reason})")
+        _teslaAttrSiteName = None
+    # Entry: among candidate sites, the one with the highest home load is
+    # likeliest to host the draw — a coincidental candidate only carries its own
+    # baseline while the hosting site carries baseline plus the multi-kW draw.
+    best: str | None = None
+    bestKw = 0.0
+    for name, site in allSites.items():
+        kw = _siteTeslaCandidateKw(site, name == activeName)
+        if kw > 0 and (best is None or site.pwState.homeWatts > allSites[best].pwState.homeWatts):
+            best, bestKw = name, kw
+    if best is not None:
+        _teslaAttrSiteName = best
+        log.info(f"[Tesla] Attributing {bestKw:.1f}kW charging to site '{best}'")
+    return best, bestKw
+
+
 def _buildSiteReadings(allSites: dict, activeName: str) -> list:
     """Build the per-site reading list stored in DashboardState.siteReadings."""
+    teslaSite, teslaKw = _attributedTeslaSite(allSites, activeName)
     return [
         {
             "name": site.name,
@@ -1481,6 +1863,14 @@ def _buildSiteReadings(allSites: dict, activeName: str) -> list:
             "surplusKw": _rawSurplusKw(site.pwState.solarWatts, site.pwState.homeWatts),
             "powerwallSocPercent": site.pwState.powerwallSocPercent,
             "error": site.error,
+            "model": site.model,
+            "firmwareVersion": site.firmwareVersion,
+            "lifetimeChargedWh": site.lifetimeChargedWh,
+            "lifetimeDischargedWh": site.lifetimeDischargedWh,
+            # ISO timestamp of the last successful poll (history only grows on success),
+            # so the UI can show per-site data age even while a site is failing.
+            "lastPolled": site.history[-1]["timestamp"] if site.history else None,
+            "teslaChargingKw": teslaKw if site.name == teslaSite else 0.0,
         }
         for site in allSites.values()
     ]
@@ -1523,20 +1913,208 @@ def _detectSiteSwitch(
 
 
 
-async def _pollOneSite(site: SiteInfo) -> bool:
-    """Poll one site's Powerwall state (solar/home/soc). Returns True on success."""
-    pw = site.pw
-    assert pw is not None, "_pollOneSite called with pw=None"
-    name = site.name
+def _formatDuration(seconds: float) -> str:
+    """Compact outage duration, e.g. '101h 12m' or '4m'."""
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def _siteUnreachablePayload(
+    name: str, error: str, consecutiveFailures: int, diagnosis: str | None, downSince: datetime | None,
+) -> dict:
+    text = (
+        f"\U0001F534 CHAOS: Powerwall '{name}' unreachable\n"
+        f"{consecutiveFailures} consecutive poll failures. Last error: {error}"
+    )
+    if diagnosis:
+        text += f"\nDiagnosis: {diagnosis}"
+    return {
+        "text": text,
+        "event": "site_unreachable",
+        "site": name,
+        "consecutiveFailures": consecutiveFailures,
+        "error": error,
+        "diagnosis": diagnosis,
+        "downSince": downSince.isoformat() if downSince else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _siteRecoveredPayload(name: str, downtimeSeconds: float | None) -> dict:
+    text = f"\U0001F7E2 CHAOS: Powerwall '{name}' reachable again"
+    if downtimeSeconds is not None:
+        text += f" after {_formatDuration(downtimeSeconds)}"
+    return {
+        "text": text,
+        "event": "site_recovered",
+        "site": name,
+        "downtimeSeconds": round(downtimeSeconds) if downtimeSeconds is not None else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _bothFullPayload(siteName: str, evSocPercent: float, powerwallSocPercent: float) -> dict:
+    text = (
+        f"\U0001F50B CHAOS: EV and Powerwall both full at '{siteName}'\n"
+        f"EV {evSocPercent:.1f}%  PW {powerwallSocPercent:.1f}% — surplus solar has nowhere to go"
+    )
+    return {
+        "text": text,
+        "event": "ev_and_powerwall_full",
+        "site": siteName,
+        "evSocPercent": round(evSocPercent, 1),
+        "powerwallSocPercent": round(powerwallSocPercent, 1),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _checkBothFullNotify(
+    site: SiteInfo,
+    evSocPercent: float | None,
+    targetEvChargePercent: float,
+    powerwallFullSocPercent: float,
+    webhookUrl: str,
+) -> None:
+    """Fire a webhook once when the EV is at its target SoC and the Powerwall
+    is full, so the user knows surplus solar is going unused. Re-arms once
+    either drops _BOTH_FULL_RESET_MARGIN_PCT below its threshold (e.g.
+    overnight Powerwall discharge) — not on small dips like 100 → 99.5 — so
+    it fires again next time both are full. Skipped while the site's last
+    poll failed, since its readings are stale."""
+    if site.error is not None or evSocPercent is None:
+        return
+    pwSoc = site.pwState.powerwallSocPercent
+    if evSocPercent >= targetEvChargePercent and pwSoc >= powerwallFullSocPercent:
+        if not site.bothFullNotified:
+            fireWebhook(webhookUrl, _bothFullPayload(site.name, evSocPercent, pwSoc))
+            site.bothFullNotified = True
+    elif (evSocPercent < targetEvChargePercent - _BOTH_FULL_RESET_MARGIN_PCT
+          or pwSoc < powerwallFullSocPercent - _BOTH_FULL_RESET_MARGIN_PCT):
+        site.bothFullNotified = False
+
+
+def _recordPollFailure(site: SiteInfo, error: str, diagnosis: str | None = None) -> None:
+    """Count a failed poll; fire the unreachable webhook once at the threshold."""
+    if site.consecutiveFailures == 0:
+        site.firstFailureTime = datetime.now(timezone.utc)
+    site.consecutiveFailures += 1
+    if site.consecutiveFailures >= _SITE_UNREACHABLE_NOTIFY_CYCLES and not site.unreachableNotified:
+        fireWebhook(_webhookUrl, _siteUnreachablePayload(
+            site.name, error, site.consecutiveFailures, diagnosis, site.firstFailureTime))
+        site.unreachableNotified = True
+
+
+# TCP connect errors worth explaining: errno → (short label, what it usually means)
+_TCP_ERRNO_HINTS = {
+    errno.ECONNREFUSED: ("connection refused", "host is up but nothing is listening on 443"),
+    errno.EHOSTUNREACH: ("host unreachable", "no ARP reply — device offline, unplugged, or not on this subnet"),
+    errno.EHOSTDOWN: ("host down", "no ARP reply — device offline, unplugged, or not on this subnet"),
+    errno.ENETUNREACH: ("network unreachable", "no route to that network"),
+}
+
+
+async def _probeSite(host: str) -> tuple[str, str]:
+    """Test a gateway's reachability layer by layer, independently of pypowerwall
+    (which hides network failures behind None readings). Returns
+    (short label for the dashboard, full detail for the log and webhook)."""
+    start = time.monotonic()
     try:
-        # Lambda groups all three synchronous Powerwall calls into one thread invocation
-        # so the event loop doesn't pay the thread-pool dispatch overhead three times.
-        _pw_read = lambda: (pw.solar(), pw.home(), pw.level(True))
-        solar, home, soc = await asyncio.to_thread(_pw_read)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, 443), _PROBE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return ("TCP timeout",
+                f"TCP {host}:443 no response in {_PROBE_TIMEOUT_S:.0f}s"
+                " — packets silently dropped (host off or not on the network, or firewall/VLAN blocking)")
+    except socket.gaierror as e:
+        return ("DNS lookup failed", f"DNS lookup of {host} failed: {e}")
+    except OSError as e:
+        errName = errno.errorcode.get(e.errno or 0, "OSError")
+        short, hint = _TCP_ERRNO_HINTS.get(e.errno or 0, (errName, str(e)))
+        return (short, f"TCP {host}:443 {short} after {time.monotonic() - start:.1f}s ({errName}: {hint})")
+    tcp = f"TCP {host}:443 connected in {(time.monotonic() - start) * 1000:.0f}ms"
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=_PROBE_TIMEOUT_S) as client:
+            r = await client.get(f"https://{host}/api/status")
+    except httpx.TimeoutException:
+        return ("HTTPS timeout", f"{tcp}; HTTPS /api/status timed out — gateway web server not responding")
+    except httpx.HTTPError as e:  # TLS handshake failures surface as ConnectError
+        return ("HTTPS failed", f"{tcp}; HTTPS /api/status failed: {type(e).__name__}: {e}")
+    status = f"HTTPS /api/status {r.status_code}"
+    if r.status_code == 200:
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            fields = [f"{k}={data[k]}" for k in ("version", "up_time", "din") if data.get(k)]
+            if fields:
+                status += f" ({', '.join(fields)})"
+    return ("gateway reachable",
+            f"{tcp}; {status} — gateway answers on the network, so the failure is in the API/auth layer")
+
+
+async def _handlePollFailure(site: SiteInfo, reason: str, pypowerwallMessage: str | None = None) -> None:
+    """Diagnose a failed poll, then log it, show it on the dashboard, and count it."""
+    host = (site.pwConfig or {}).get("host")
+    short, detail = await _probeSite(host) if host else (None, None)
+    site.error = f"{reason} — {short}" if short else reason
+    downFor = (datetime.now(timezone.utc) - site.firstFailureTime).total_seconds() if site.firstFailureTime else 0
+    parts = [f"Poll failed: {reason}", f"down {_formatDuration(downFor)} ({site.consecutiveFailures + 1} polls)"]
+    if pypowerwallMessage:
+        parts.append(f"pypowerwall: {pypowerwallMessage}")
+    if detail:
+        parts.append(f"probe: {detail}")
+    log.warning(f"[Powerwall:{site.name}] " + " | ".join(parts))
+    _recordPollFailure(site, site.error, detail)
+
+
+async def _pollOneSite(site: SiteInfo) -> bool:
+    """Poll one site's Powerwall state (solar/home/soc). Returns True on success.
+
+    Fires a webhook after _SITE_UNREACHABLE_NOTIFY_CYCLES consecutive failed
+    polls, and again once the site recovers. Failures are exceptions
+    (network/API errors) and all-zero readings — pypowerwall returns None for
+    everything rather than raising when the gateway is offline or login fails.
+    Solar-zero transients below don't count; they have their own inline
+    retry/recovery.
+
+    A site that failed to connect at startup (pw=None) counts as failed every
+    cycle, with a reconnect attempted at most every _SITE_RECONNECT_INTERVAL_S.
+    """
+    name = site.name
+    if site.pw is None:
+        now = datetime.now(timezone.utc)
+        due = (site.lastReconnectAttempt is None
+               or (now - site.lastReconnectAttempt).total_seconds() >= _SITE_RECONNECT_INTERVAL_S)
+        if site.pwConfig is not None and due:
+            site.lastReconnectAttempt = now
+            try:
+                site.pw = await _connectPowerwall(site.pwConfig, name)
+                site.model, site.firmwareVersion = await asyncio.to_thread(_readPowerwallInfo, site.pw)
+            except Exception as e:
+                site.pw = None
+                await _handlePollFailure(site, f"Reconnect failed: {e}")
+                return False
+        if site.pw is None:
+            _recordPollFailure(site, site.error or "Not connected")
+            return False
+    pw = site.pw
+    try:
+        # Lambda groups the synchronous Powerwall calls into one thread invocation
+        # so the event loop doesn't pay the thread-pool dispatch overhead per call.
+        # battery(verbose=True) reads the same cached aggregates payload and adds
+        # the lifetime energy counters.
+        # runCapturing also returns pypowerwall's last failure message, which it
+        # otherwise logs only at DEBUG before returning None.
+        _pw_read = lambda: (pw.solar(), pw.home(), pw.level(True), pw.battery(verbose=True))
+        (solar, home, soc, battery), pwMessage = await asyncio.to_thread(_pypowerwallCapture.runCapturing, _pw_read)
         if (solar or 0) == 0:
             if (home or 0) == 0 and (soc or 0) == 0:
-                site.error = "All-zero reading (transient?)"
-                log.warning(f"[Powerwall:{name}] All-zero reading — skipping update")
+                await _handlePollFailure(site, "All-zero reading", pwMessage)
                 return False
             if site.pwState.avgSolarWatts > _SOLAR_ZERO_SUSPECT_W:
                 # 0W solar with a healthy rolling average suggests a transient read failure
@@ -1547,7 +2125,7 @@ async def _pollOneSite(site: SiteInfo) -> bool:
                         f" — retrying ({attempt + 1}/{_PW_POLL_RETRY_ATTEMPTS})"
                     )
                     await asyncio.sleep(_PW_POLL_RETRY_DELAY_S)
-                    solar, home, soc = await asyncio.to_thread(_pw_read)
+                    (solar, home, soc, battery), _ = await asyncio.to_thread(_pypowerwallCapture.runCapturing, _pw_read)
                     if (solar or 0) > 0:
                         break  # retry recovered a valid reading
                 if (solar or 0) == 0:
@@ -1560,20 +2138,39 @@ async def _pollOneSite(site: SiteInfo) -> bool:
                         site.pwState.updateSoc(soc_f)
                     return False
         site.pwState.update(float(solar or 0), float(home or 0), float(soc or 0))
+        if isinstance(battery, dict):  # lifetime counters are best-effort display data
+            # TEDAPI mode has no lifetime counters (pypowerwall stubs them as 0) —
+            # treat zero/None as unavailable rather than displaying "0 kWh".
+            site.lifetimeChargedWh = battery.get("energy_imported") or None
+            site.lifetimeDischargedWh = battery.get("energy_exported") or None
         site.error = None
+        if site.consecutiveFailures:
+            downtime = ((datetime.now(timezone.utc) - site.firstFailureTime).total_seconds()
+                        if site.firstFailureTime else None)
+            log.info(f"[Powerwall:{name}] Reachable again after {site.consecutiveFailures} failed polls"
+                     + (f" (down {_formatDuration(downtime)})" if downtime is not None else ""))
+            if site.unreachableNotified:
+                fireWebhook(_webhookUrl, _siteRecoveredPayload(name, downtime))
+                site.unreachableNotified = False
+        site.consecutiveFailures = 0
+        site.firstFailureTime = None
         return True
     except Exception as e:
-        site.error = str(e)
-        log.warning(f"[Powerwall:{name}] Poll failed: {e}")
+        await _handlePollFailure(site, f"{type(e).__name__}: {e}")
         return False
 
 
 async def _pollAllSites(allSites: dict) -> None:
     """Concurrently poll ALL Powerwall sites and append a PW-only history entry
     to every site that polled successfully (including the active site)."""
-    coros = [_pollOneSite(site) for site in allSites.values() if site.pw is not None]
+    coros = [_pollOneSite(site) for site in allSites.values()]
     await asyncio.gather(*coros)
     now_iso = datetime.now(timezone.utc).isoformat()
+    # Last-known Tesla SOCs, keyed by VIN (stable across renames), stamped into every
+    # fresh entry at construction: all sites' histories carry the series and the value
+    # is persisted with the entry rather than mutated in after _saveLongHistory ran.
+    teslaSoc = ({v["vin"]: v["socPercent"] for v in _dashboard.teslaVehicles}
+                if _dashboard.teslaConfigured else None)
     for site in allSites.values():
         if site.error is None:
             pw = site.pwState
@@ -1584,6 +2181,8 @@ async def _pollAllSites(allSites: dict) -> None:
                 "surplusKw": _rawSurplusKw(pw.solarWatts, pw.homeWatts),
                 "powerwallSocPercent": round(pw.powerwallSocPercent, 1),
             }
+            if teslaSoc is not None:
+                entry["teslaSoc"] = dict(teslaSoc)  # fresh dict per entry; entries are shared with longHistory and persisted
             site.history.append(entry)
             now_dt = datetime.now(timezone.utc)
             if site.lastLongHistoryTime is None or (now_dt - site.lastLongHistoryTime).total_seconds() >= _LONG_HISTORY_INTERVAL_SECS:
@@ -1592,7 +2191,157 @@ async def _pollAllSites(allSites: dict) -> None:
                 _saveLongHistory(site)
 
 
+def _teslaReadVehicles(tesla, wantedNames: list[str]) -> dict:
+    """Synchronous teslapy reads — must run inside asyncio.to_thread.
+
+    Read-only and never wakes a vehicle: get_vehicle_data() is only called when
+    the cheap vehicle-list call reports the vehicle online."""
+    if not tesla.authorized:
+        # authorized only checks the in-memory token; teslapy re-reads the cache
+        # file solely at construction and after fetch/refresh. Reload it here so a
+        # token created by --tesla-login while the daemon runs is picked up.
+        tesla._token_updater()
+        if not tesla.authorized:
+            return {"status": "unauthorized"}
+    vehicles = tesla.vehicle_list()
+    if not vehicles:
+        return {"status": "no_vehicles"}
+    if wantedNames:
+        byName = {v["display_name"]: v for v in vehicles}
+        wanted = [byName[n] for n in wantedNames if n in byName]
+        if not wanted:
+            # Surface the mismatch (typo/rename) instead of silently showing nothing.
+            return {"status": "no_match", "accountNames": [v["display_name"] or v["vin"] for v in vehicles]}
+        vehicles = wanted
+    results = []
+    for v in vehicles:
+        vin = v["vin"]
+        name = v["display_name"] or vin
+        if v["state"] != "online":
+            results.append({"vin": vin, "name": name, "status": "asleep"})
+            continue
+        try:
+            data = v.get_vehicle_data()
+        except Exception:
+            # Car fell asleep between the list and data calls (HTTP 408) or a
+            # per-vehicle hiccup — report it asleep rather than failing the fleet.
+            results.append({"vin": vin, "name": name, "status": "asleep"})
+            continue
+        cs = data.get("charge_state") or {}
+        vs = data.get("vehicle_state") or {}
+        rangeMiles = cs.get("battery_range")   # Owner API reports miles regardless of account units
+        odoMiles = vs.get("odometer")
+        results.append({
+            "vin": vin,
+            "name": data.get("display_name") or name,
+            "status": "online",
+            "socPercent": cs.get("battery_level"),
+            "chargeStateName": cs.get("charging_state") or "",
+            "chargingKw": float(cs.get("charger_power") or 0),
+            "rangeKm": round(rangeMiles * _MILES_TO_KM, 1) if rangeMiles is not None else None,
+            "chargeLimitPercent": cs.get("charge_limit_soc"),
+            "model": _teslaModelName(data.get("vehicle_config") or {}),
+            "odometerKm": round(odoMiles * _MILES_TO_KM, 1) if odoMiles is not None else None,
+            "softwareVersion": (vs.get("car_version") or "").split(" ")[0],  # strip the build hash
+        })
+    return {"status": "ok", "vehicles": results}
+
+
+_teslaFailed = False  # True while Tesla polling is failing; gates WARNING→DEBUG log demotion
+# Data fields of a per-vehicle dashboard entry (identity/asleep/lastPolled aside);
+# the authoritative schema is the online dict built in _teslaReadVehicles.
+_TESLA_VEHICLE_DATA_KEYS = ("socPercent", "chargeStateName", "chargingKw", "rangeKm", "chargeLimitPercent",
+                            "model", "odometerKm", "softwareVersion")
+# Owner API vehicle_config.car_type → friendly model name (unknown types display raw).
+# "lychee"/"tamarind" are Tesla's internal codenames for the refreshed S/X platforms.
+_TESLA_MODEL_NAMES = {"models": "Model S", "models2": "Model S", "lychee": "Model S",
+                      "model3": "Model 3", "modelx": "Model X", "tamarind": "Model X",
+                      "modely": "Model Y", "cybertruck": "Cybertruck"}
+
+
+def _teslaModelName(vehicleConfig: dict) -> str:
+    """Friendly model + trim from vehicle_config, e.g. 'Model X Plaid'."""
+    carType = (vehicleConfig.get("car_type") or "").lower()
+    model = _TESLA_MODEL_NAMES.get(carType, carType)
+    trim = (vehicleConfig.get("trim_badging") or "").lower()
+    if not trim:
+        return model
+    # Performance badges are reported as internal codes (e.g. 'p100d', 'p74d');
+    # the marketing name depends on the platform.
+    if trim.startswith("p"):
+        if carType in ("lychee", "tamarind"):
+            return f"{model} Plaid"   # refreshed S/X performance is Plaid
+        if carType in ("model3", "modely"):
+            return f"{model}P"        # 3/Y performance badge → 'Model 3P'
+    # Legacy platforms keep the literal badge: digits all-caps ('p90d' → 'P90D')
+    trim = trim.upper() if any(c.isdigit() for c in trim) else trim.capitalize()
+    return f"{model} {trim}".strip()
+
+
+def _teslaPollFailed(message: str) -> None:
+    """Mark Tesla unavailable; log loudly on the first failure of a streak only."""
+    global _teslaFailed
+    (log.debug if _teslaFailed else log.warning)(f"[Tesla] {message}")
+    _teslaFailed = True
+    _dashboard.teslaAvailable = False
+    _dashboard.teslaError = message
+
+
+async def pollTesla(tesla, teslaConfig: dict) -> None:
+    """Poll Tesla vehicles read-only and update _dashboard. Never raises."""
+    global _teslaFailed
+    try:
+        result = await asyncio.to_thread(_teslaReadVehicles, tesla, teslaConfig.get("vehicleNames") or [])
+    except Exception as e:
+        _teslaPollFailed(f"poll failed: {e}")
+        return
+    if result["status"] == "unauthorized":
+        _teslaPollFailed("not logged in — run: uv run python chaos.py --tesla-login")
+        return
+    if result["status"] == "no_vehicles":
+        _teslaPollFailed("no vehicles on Tesla account")
+        return
+    if result["status"] == "no_match":
+        _teslaPollFailed("no vehicle matched config vehicleNames; account has: " + ", ".join(result["accountNames"]))
+        return
+    if _teslaFailed:
+        log.info("[Tesla] Polling recovered")
+        _teslaFailed = False
+    _dashboard.teslaAvailable = True
+    _dashboard.teslaError = None
+    prevByVin = {v["vin"]: v for v in _dashboard.teslaVehicles}
+    merged = []
+    for r in result["vehicles"]:
+        if r["status"] == "asleep":
+            prev = prevByVin.get(r["vin"])
+            # Keep last-known values (and their lastPolled age) while the car sleeps.
+            entry = dict(prev) if prev else {
+                "vin": r["vin"], "name": r["name"], "lastPolled": None,
+                **{k: None for k in _TESLA_VEHICLE_DATA_KEYS},
+            }
+            glitches = (prev or {}).get("glitchPolls", 0) + 1
+            wasCharging = bool(prev) and not prev.get("asleep") and (prev.get("chargingKw") or 0) > 0
+            if wasCharging and glitches <= _TESLA_CHARGING_GRACE_POLLS:
+                # Cars don't sleep mid-charge: an Owner-API non-online flap (or a
+                # failed data call) while charging is a glitch — keep last-known
+                # awake state so attribution and the fast poll cadence survive it.
+                entry["glitchPolls"] = glitches
+                log.info(f"[Tesla:{entry['name']}] Non-online report while charging — glitch {glitches}/{_TESLA_CHARGING_GRACE_POLLS}, keeping last-known state")
+            else:
+                entry["asleep"] = True
+                entry["glitchPolls"] = 0
+        else:
+            entry = {k: v for k, v in r.items() if k != "status"}
+            entry["asleep"] = False
+            entry["glitchPolls"] = 0
+            entry["lastPolled"] = datetime.now(timezone.utc).isoformat()
+            log.info(f"[Tesla:{r['name']}] SOC={r['socPercent']}%  State={r['chargeStateName']}  Power={r['chargingKw']:.1f}kW")
+        merged.append(entry)
+    _dashboard.teslaVehicles = merged
+
+
 async def runChaos(config):
+    global _chargingMode, _webhookUrl
     _validateConfig(config)
     #pypowerwall.set_debug(True)
     log.info("CHAOS version %s starting", __version__)
@@ -1600,6 +2349,12 @@ async def runChaos(config):
     activeName = config["activePowerwall"]
     lucidConfig = config["lucid"]
     chargingConfig = config["charging"]
+    chargingModeStr = chargingConfig.get("chargingMode", "enabled")
+    try:
+        _chargingMode = ChargingMode(chargingModeStr)
+    except ValueError:
+        raise RuntimeError(f"Invalid charging.chargingMode '{chargingModeStr}' — must be 'enabled', 'manual', or 'disabled'")
+    _dashboard.chargingMode = _chargingMode
     notificationsConfig = config.get("notifications", {})
     pollingIntervalSeconds = config["pollingIntervalSeconds"]
     dashboard_cfg = config.get("dashboard", {})
@@ -1608,6 +2363,21 @@ async def runChaos(config):
         raise RuntimeError(f"Invalid units '{units}' in config — must be 'imperial' or 'metric'")
 
     webhookUrl = notificationsConfig.get("webhookUrl", "") if notificationsConfig.get("enabled") else ""
+    _webhookUrl = webhookUrl
+    powerwallFullSocPercent = notificationsConfig.get("powerwallFullSocPercent", 100)
+    teslaConfig = config.get("tesla") or {}
+    tesla = None
+    if _teslaEnabled(config):
+        _dashboard.teslaConfigured = True
+        try:
+            # No network I/O here — just a requests session; auth is checked per poll.
+            _ensureTeslaCacheFile()
+            tesla = teslapy.Tesla(teslaConfig["email"], cache_file=str(_TESLA_CACHE_FILE))
+        except Exception as e:
+            _dashboard.teslaAvailable = False
+            _dashboard.teslaError = str(e)
+            log.warning(f"[Tesla] Failed to initialize client: {e}")
+    teslaPollIntervalS = teslaConfig.get("pollIntervalSeconds", _TESLA_POLL_INTERVAL_S_DEFAULT)
     thresholds = ChargingThresholds(
         minPowerwallSocPercent=chargingConfig["minPowerwallSocPercent"],
         targetEvChargePercent=chargingConfig["targetEvChargePercent"],
@@ -1625,10 +2395,11 @@ async def runChaos(config):
         name = pwConf["name"]
         try:
             pw = await _connectPowerwall(pwConf, name)
-            allSites[name] = SiteInfo(name=name, pw=pw)
+            allSites[name] = SiteInfo(name=name, pw=pw, pwConfig=pwConf)
+            allSites[name].model, allSites[name].firmwareVersion = await asyncio.to_thread(_readPowerwallInfo, pw)
         except Exception as e:
             log.warning(f"[Powerwall] Failed to connect to '{name}' at startup: {e}")
-            allSites[name] = SiteInfo(name=name, pw=None, error=str(e))
+            allSites[name] = SiteInfo(name=name, pw=None, error=str(e), pwConfig=pwConf)
         _loadLongHistory(allSites[name])
 
     if allSites[activeName].pw is None:
@@ -1699,6 +2470,7 @@ async def runChaos(config):
         forcedEvPollPending = False
         pendingSwitchAnnotation: str | None = None
         nextEvPollDue: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        nextTeslaPollDue: datetime = datetime.min.replace(tzinfo=timezone.utc)
         evPollFactor: int = 1
 
         async def _doSiteSwitch(newName: str, annotation: str) -> None:
@@ -1715,13 +2487,32 @@ async def runChaos(config):
             try:
                 # Poll ALL sites concurrently; every successful site gets a history entry.
                 await _pollAllSites(allSites)
+                # Refresh dashboard site data and poll Tesla BEFORE the Lucid decision
+                # chain: a processCycle failure re-raises, and these independent
+                # sources must not freeze during a Lucid outage.
+                _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
+                if tesla is not None and datetime.now(timezone.utc) >= nextTeslaPollDue:
+                    await pollTesla(tesla, teslaConfig)
+                    # Jitter tolerance: the due time is set ~1s after cycle start (poll
+                    # duration), so without it the next cycle arrives fractionally
+                    # early and skips a poll, going 120s between reads.
+                    delay = max(0.0, _teslaPollDelayS(teslaPollIntervalS) - _TESLA_POLL_JITTER_S)
+                    nextTeslaPollDue = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 now = datetime.now(timezone.utc)
                 evPollDue = now >= nextEvPollDue or forcedByUser or forcedEvPollPending
                 if allSites[activeName].error:
                     log.warning(f"[Powerwall:{activeName}] Active site poll failed — skipping decision cycle")
                 elif evPollDue:
                     prevCommandTime = cachedState.lastCommandTime if cachedState else None
-                    cachedState, evPollFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
+                    try:
+                        cachedState, evPollFactor = await processCycle(lucid, thresholds, webhookUrl, lucidConfig, cachedState, _dashboard, forceEvPoll=forcedByUser or forcedEvPollPending, pwState=allSites[activeName].pwState, siteName=activeName)
+                        _dashboard.lucidError = None
+                    except Exception as e:
+                        # Attribute the failure to the Lucid vehicle for the dashboard,
+                        # then let the outer handlers do their usual work (lastError,
+                        # webhook, Powerwall reconnect).
+                        _dashboard.lucidError = str(e)
+                        raise
                     nextEvPollDue = datetime.now(timezone.utc) + timedelta(seconds=pollingIntervalSeconds * evPollFactor)
                     # processCycle succeeded — clear any pending forced EV poll.
                     forcedEvPollPending = False
@@ -1780,7 +2571,14 @@ async def runChaos(config):
                                     _autoSwitchConsecutiveCount.clear()
                             else:
                                 _autoSwitchConsecutiveCount.clear()
-                _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)
+                _dashboard.siteReadings = _buildSiteReadings(allSites, activeName)  # again: isActive may have changed via auto-switch
+                _checkBothFullNotify(
+                    allSites[activeName],
+                    cachedState.evSocPercent if cachedState else None,
+                    thresholds.targetEvChargePercent,
+                    powerwallFullSocPercent,
+                    webhookUrl,
+                )
                 _dashboard.lastError = None
             except asyncio.CancelledError:
                 log.info("Shutting down.")
@@ -1820,6 +2618,7 @@ async def runChaos(config):
                 log.info("Poll cycle triggered by user request.")
                 forcedByUser = True
                 nextEvPollDue = datetime.min.replace(tzinfo=timezone.utc)  # force EV poll on next cycle
+                nextTeslaPollDue = datetime.min.replace(tzinfo=timezone.utc)  # refresh Tesla too
             except asyncio.TimeoutError:
                 forcedByUser = False
             finally:
@@ -1841,6 +2640,7 @@ async def runChaos(config):
                         else:
                             # Startup connection failed — attempt reconnect now.
                             site.pw = await _connectPowerwall(newPwConfig, newName)
+                            site.model, site.firmwareVersion = await asyncio.to_thread(_readPowerwallInfo, site.pw)
                             site.error = None
                         await _doSiteSwitch(newName, "⇄")
                         forcedEvPollPending = True
@@ -1850,8 +2650,71 @@ async def runChaos(config):
                 else:
                     log.warning(f"[Powerwall] Unknown site name '{newName}' — ignoring switch request")
 
+def teslaInteractiveLogin(config) -> None:
+    """One-time interactive Tesla OAuth handshake; populates _TESLA_CACHE_FILE.
+
+    Interactive CLI mode (not the daemon), so print/input are used deliberately.
+    fetch_token must run on the same Tesla instance that generated the URL —
+    the PKCE verifier and state only live in that instance's memory."""
+    teslaCfg = config.get("tesla") or {}
+    email = teslaCfg.get("email")
+    if not email:
+        raise SystemExit("config.json needs a 'tesla' block with 'email' before login")
+    _ensureTeslaCacheFile()
+    tesla = teslapy.Tesla(email, cache_file=str(_TESLA_CACHE_FILE))
+    if tesla.authorized:
+        print(f"Already authorized; token cache at {_TESLA_CACHE_FILE} is valid.")
+        return
+    # teslapy's redirect_uri (tesla://auth/callback) is the only one Tesla still
+    # registers for the ownerapi client — the classic https://auth.tesla.com/void/
+    # callback is rejected with "redirect_uri not registered". The tesla:// link
+    # can't render in a browser, so the user copies it from the address bar.
+    authUrl = tesla.authorization_url()
+    assert isinstance(authUrl, str), "Tesla authorization_url() returned an unexpected type"
+    # The state in the URL identifies this handshake; used as fallback when the
+    # user pastes a bare code that carries no state of its own.
+    expectedState = (parse_qs(urlparse(authUrl).query).get("state") or [""])[0]
+    print("Open this URL in a browser (any machine) and log in to your Tesla account:")
+    print()
+    print(authUrl)
+    print()
+    print("After signing in, the final redirect targets the Tesla app, so the browser")
+    print("shows an error page or gets stuck on 'Verified Successfully' / 'Loading…' —")
+    print("that is expected. Get the authorization code one of these ways:")
+    print(f"  1. If the address bar now shows {tesla.redirect_uri}?code=... — copy that full URL.")
+    print("  2. If the address bar did NOT change (stuck on Loading…): repeat the login in")
+    print("     Firefox — its error page always shows the tesla:// URL to copy.")
+    print("  3. Or use DevTools: open Network tab, enable 'Preserve log', log in again,")
+    print("     click the last request to auth.tesla.com (status 302) and copy the")
+    print("     'location' response header — or paste just the code value from it.")
+    for _ in range(3):
+        try:
+            redirected = input("Paste the redirect URL (or just the code) here: ").strip()
+        except EOFError:
+            raise SystemExit("Aborted — no input.")
+        responseUrl = _teslaAuthResponseUrl(redirected, tesla.redirect_uri, expectedState)
+        if responseUrl is None:
+            print("No authorization code found in that. Paste the tesla://auth/callback?code=...")
+            print("URL (or the bare code value), not the login-page URL.")
+            continue
+        try:
+            tesla.fetch_token(authorization_response=responseUrl)
+        except Exception as e:
+            raise SystemExit(
+                f"Token exchange failed: {e}\n"
+                "Note: complete the login using the URL printed by THIS run — "
+                "a code from an earlier attempt is bound to that run and won't work."
+            )
+        print(f"Token saved to {_TESLA_CACHE_FILE} — treat this file like a password.")
+        return
+    raise SystemExit("No valid redirect URL provided after 3 attempts.")
+
+
 def main():
     config = loadConfig()
+    if "--tesla-login" in sys.argv:
+        teslaInteractiveLogin(config)
+        return
     try:
         asyncio.run(runChaos(config))
     except KeyboardInterrupt:

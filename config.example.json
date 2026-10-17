@@ -22,7 +22,8 @@
     "maxChargingAmps": 32,
     "commandCooldownMinutes": 10,
     "stopConfirmCycles": 4,
-    "allowExternalChargeInterference": true
+    "allowExternalChargeInterference": true,
+    "chargingMode": "enabled"
   },
   "pollingIntervalSeconds": 60,
   "dashboard": {
@@ -34,6 +35,13 @@
   },
   "notifications": {
     "enabled": false,
-    "webhookUrl": ""
+    "webhookUrl": "",
+    "powerwallFullSocPercent": 100
+  },
+  "tesla": {
+    "enabled": false,
+    "email": "",
+    "vehicleNames": [],
+    "pollIntervalSeconds": 300
   }
 }

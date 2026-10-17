@@ -26,14 +26,18 @@
 
 import asyncio
 import collections
+import errno
 import json
 import logging
 import tempfile
 import pathlib
+import socket
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 from httpx import AsyncClient, ASGITransport
 
 import grpc
@@ -42,6 +46,7 @@ from lucidmotors.exceptions import APIError
 
 from chaos import (
     ChargingAction,
+    ChargingMode,
     ChargingThresholds,
     DashboardState,
     PowerwallState,
@@ -49,6 +54,7 @@ from chaos import (
     VehicleState,
     _HTML_TEMPLATE,
     _buildSiteReadings,
+    _checkBothFullNotify,
     _connectPowerwall,
     _decideChargingAction,
     _detectSiteSwitch,
@@ -58,6 +64,12 @@ from chaos import (
     _LUCID_RATE_LIMIT_DELAY_SECS,
     _pollAllSites,
     _pollOneSite,
+    _probeSite,
+    _pypowerwallCapture,
+    _siteRecoveredPayload,
+    _siteUnreachablePayload,
+    _SITE_RECONNECT_INTERVAL_S,
+    _SITE_UNREACHABLE_NOTIFY_CYCLES,
     _shouldForceEarlyEvPoll,
     _webApp,
     _validateConfig,
@@ -68,6 +80,12 @@ from chaos import (
     _LONG_HISTORY_MAXLEN,
     _LONG_HISTORY_INTERVAL_SECS,
     _writePowerwallToConfig,
+    _writeChargingModeToConfig,
+    _teslaEnabled,
+    _teslaReadVehicles,
+    _MILES_TO_KM,
+    pollTesla,
+    teslaInteractiveLogin,
     fireWebhook,
     loadConfig,
     processCycle,
@@ -78,6 +96,14 @@ from chaos import (
 )
 from lucidmotors.gen.vehicle_state_service_pb2 import ChargeState as CS
 from pypowerwall.local.exceptions import PowerwallConnectionError
+
+@pytest.fixture(autouse=True)
+def _noRealSiteProbe():
+    """Failed site polls run a TCP/HTTPS reachability probe; keep tests off the network.
+    Tests of the probe itself use the _probeSite imported above (the unpatched original)."""
+    with patch("chaos._probeSite", AsyncMock(return_value=("probe-short", "probe-detail"))) as probe:
+        yield probe
+
 
 # ---------------------------------------------------------------------------
 # Config builder helpers (used by TestConfigValidation)
@@ -299,7 +325,7 @@ def _decide(
     lastCommandWasStart=False,
     effectiveSurplusKw=2.4,
     evSocPercent=50.0,
-    chargingEnabled=True,
+    chargingMode=ChargingMode.ENABLED,
     lowSurplusCycles=0,
 ):
     return _decideChargingAction(
@@ -314,7 +340,7 @@ def _decide(
         pwState=pw,
         effectiveSurplusKw=effectiveSurplusKw,
         evSocPercent=evSocPercent,
-        chargingEnabled=chargingEnabled,
+        chargingMode=chargingMode,
         lowSurplusCycles=lowSurplusCycles,
     )
 
@@ -981,7 +1007,7 @@ class TestPollVehicleAndDecide:
         # Pre-fill home history with high-EV readings
         for _ in range(3):
             pw_good.update(5000, 4500, 80)
-        assert len(pw_good._homeHistory) == 3
+        assert len(pw_good._homeHistory) == 4
         await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
         assert len(pw_good._homeHistory) == 0
 
@@ -1238,6 +1264,74 @@ class TestGracefulShutdown:
 
             # runChaos should return cleanly when CancelledError propagates from processCycle
             await runChaos(config)  # must not raise
+
+    async def test_charging_mode_loaded_from_config_at_startup(self, thresholds, pw_good):
+        """Regression test: a chargingMode persisted in config.json must be
+        restored into the runtime _chargingMode global at startup, otherwise a
+        process restart while charging is disabled/manual silently re-enables it."""
+        import chaos
+        from chaos import runChaos
+
+        config = await self._make_chaos_deps(thresholds, pw_good)
+        config["charging"]["chargingMode"] = "disabled"
+
+        lucid_mock, vehicle_mock = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+        vehicle_mock.config.nickname = "TestCar"
+        vehicle_mock.config.vin = "TEST123"
+
+        pw_mock = MagicMock()
+        pw_mock.solar.return_value = pw_good.solarWatts
+        pw_mock.home.return_value = pw_good.homeWatts
+        pw_mock.level.return_value = pw_good.powerwallSocPercent
+        pw_mock.is_connected.return_value = True
+
+        chaos._chargingMode = ChargingMode.ENABLED  # simulate the pre-fix default before startup runs
+        try:
+            with (
+                patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+                patch("chaos.LucidAPI") as MockLucidAPI,
+                patch("chaos.processCycle", new=AsyncMock(side_effect=asyncio.CancelledError)),
+            ):
+                MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+                MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+                await runChaos(config)
+            assert chaos._chargingMode is ChargingMode.DISABLED
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
+
+    async def test_charging_mode_manual_loaded_from_config_at_startup(self, thresholds, pw_good):
+        """Companion test: 'manual' in config.json restores ChargingMode.MANUAL."""
+        import chaos
+        from chaos import runChaos
+
+        config = await self._make_chaos_deps(thresholds, pw_good)
+        config["charging"]["chargingMode"] = "manual"
+
+        lucid_mock, vehicle_mock = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+        vehicle_mock.config.nickname = "TestCar"
+        vehicle_mock.config.vin = "TEST123"
+
+        pw_mock = MagicMock()
+        pw_mock.solar.return_value = pw_good.solarWatts
+        pw_mock.home.return_value = pw_good.homeWatts
+        pw_mock.level.return_value = pw_good.powerwallSocPercent
+        pw_mock.is_connected.return_value = True
+
+        chaos._chargingMode = ChargingMode.ENABLED
+        try:
+            with (
+                patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+                patch("chaos.LucidAPI") as MockLucidAPI,
+                patch("chaos.processCycle", new=AsyncMock(side_effect=asyncio.CancelledError)),
+            ):
+                MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+                MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+                await runChaos(config)
+            assert chaos._chargingMode is ChargingMode.MANUAL
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -1939,6 +2033,508 @@ class TestPollOneSitePwZeroFilter:
 
 
 # ---------------------------------------------------------------------------
+# _pollOneSite — unreachable/recovered webhook notifications
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSiteUnreachableWebhook:
+    def _bad_pw(self):
+        from pypowerwall.local.exceptions import LoginError
+        bad_pw = MagicMock()
+        bad_pw.solar.side_effect = LoginError("auth failed")
+        return bad_pw
+
+    def _good_pw(self):
+        good_pw = MagicMock()
+        good_pw.solar.return_value = 1000
+        good_pw.home.return_value = 500
+        good_pw.level.return_value = 50
+        good_pw.battery.return_value = {}
+        return good_pw
+
+    async def test_no_webhook_before_threshold(self):
+        """Fewer than _SITE_UNREACHABLE_NOTIFY_CYCLES consecutive failures: no webhook fires."""
+        site = SiteInfo(name="Site", pw=self._bad_pw())
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES - 1):
+                await _pollOneSite(site)
+
+        assert fired == []
+        assert site.consecutiveFailures == _SITE_UNREACHABLE_NOTIFY_CYCLES - 1
+
+    async def test_webhook_fires_once_at_threshold(self):
+        """At the Nth consecutive failure a site_unreachable webhook fires exactly once,
+        even if failures continue past the threshold."""
+        site = SiteInfo(name="Site", pw=self._bad_pw())
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES + 2):
+                await _pollOneSite(site)
+
+        assert len(fired) == 1
+        assert fired[0]["event"] == "site_unreachable"
+        assert fired[0]["site"] == "Site"
+        assert "auth failed" in fired[0]["error"]
+        assert site.unreachableNotified is True
+
+    async def test_recovery_webhook_fires_after_notified(self):
+        """Once unreachable has been notified, the next successful poll fires
+        site_recovered and resets the failure/notified state."""
+        site = SiteInfo(name="Site", pw=self._bad_pw())
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES):
+                await _pollOneSite(site)
+            assert len(fired) == 1
+
+            site.pw = self._good_pw()
+            result = await _pollOneSite(site)
+
+        assert result is True
+        assert len(fired) == 2
+        assert fired[1]["event"] == "site_recovered"
+        assert fired[1]["site"] == "Site"
+        assert site.unreachableNotified is False
+        assert site.consecutiveFailures == 0
+
+    async def test_success_before_threshold_does_not_fire_recovery(self):
+        """If the site recovers before ever crossing the notify threshold, no
+        webhook (unreachable or recovered) fires at all."""
+        site = SiteInfo(name="Site", pw=self._bad_pw())
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES - 1):
+                await _pollOneSite(site)
+
+            site.pw = self._good_pw()
+            await _pollOneSite(site)
+
+        assert fired == []
+        assert site.consecutiveFailures == 0
+
+    async def test_all_zero_readings_count_toward_unreachable(self):
+        """pypowerwall returns None/0 for everything (no exception) when it can't
+        reach or log into the gateway — sustained all-zero readings must still
+        fire site_unreachable."""
+        zero_pw = MagicMock()
+        zero_pw.solar.return_value = None
+        zero_pw.home.return_value = None
+        zero_pw.level.return_value = None
+        site = SiteInfo(name="Site", pw=zero_pw)
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES + 2):
+                await _pollOneSite(site)
+
+        assert len(fired) == 1
+        assert fired[0]["event"] == "site_unreachable"
+        assert "All-zero" in fired[0]["error"]
+        assert site.unreachableNotified is True
+
+    async def test_never_connected_site_fires_unreachable(self):
+        """A site whose startup connection failed (pw=None) counts every cycle as a
+        failure, so it alerts on the same schedule as any other outage."""
+        site = SiteInfo(name="Site", pw=None, error="startup failed",
+                        pwConfig={"host": "1.2.3.4"})
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+            patch("chaos._connectPowerwall", AsyncMock(side_effect=RuntimeError("no route"))),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES):
+                assert await _pollOneSite(site) is False
+
+        assert len(fired) == 1
+        assert fired[0]["event"] == "site_unreachable"
+        assert "no route" in fired[0]["error"]
+
+    async def test_reconnect_attempts_are_throttled(self):
+        """Reconnect is attempted at most once per _SITE_RECONNECT_INTERVAL_S, since a
+        failed attempt can block the shared poll cycle for up to 30s."""
+        site = SiteInfo(name="Site", pw=None, error="startup failed",
+                        pwConfig={"host": "1.2.3.4"})
+        connect = AsyncMock(side_effect=RuntimeError("no route"))
+        with patch("chaos._connectPowerwall", connect), patch("chaos.fireWebhook"):
+            for _ in range(3):
+                await _pollOneSite(site)
+            assert connect.await_count == 1
+
+            site.lastReconnectAttempt -= timedelta(seconds=_SITE_RECONNECT_INTERVAL_S + 1)
+            await _pollOneSite(site)
+            assert connect.await_count == 2
+
+    async def test_successful_reconnect_polls_and_fires_recovered(self):
+        """Once a never-connected site comes back, it is polled normally in the same
+        cycle and the recovery webhook fires."""
+        site = SiteInfo(name="Site", pw=None, error="startup failed",
+                        pwConfig={"host": "1.2.3.4"})
+        fired = []
+        good_pw = self._good_pw()
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+            patch("chaos._connectPowerwall", AsyncMock(side_effect=RuntimeError("no route"))),
+        ):
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES):
+                await _pollOneSite(site)
+        assert site.unreachableNotified is True
+
+        site.lastReconnectAttempt = None
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+            patch("chaos._connectPowerwall", AsyncMock(return_value=good_pw)),
+            patch("chaos._readPowerwallInfo", return_value=("PW3", "25.1")),
+        ):
+            result = await _pollOneSite(site)
+
+        assert result is True
+        assert site.pw is good_pw
+        assert site.model == "PW3"
+        assert site.error is None
+        assert site.pwState.solarWatts == 1000
+        assert fired[-1]["event"] == "site_recovered"
+        assert site.consecutiveFailures == 0
+
+
+# ---------------------------------------------------------------------------
+# Site-failure diagnostics — reachability probe, pypowerwall reason capture,
+# outage duration
+# ---------------------------------------------------------------------------
+
+def _fakeWriter():
+    writer = MagicMock()
+    writer.wait_closed = AsyncMock()
+    return writer
+
+
+@pytest.mark.asyncio
+class TestProbeSite:
+    async def test_host_unreachable(self):
+        err = OSError(errno.EHOSTUNREACH, "No route to host")
+        with patch("chaos.asyncio.open_connection", AsyncMock(side_effect=err)):
+            short, detail = await _probeSite("192.168.2.220")
+        assert short == "host unreachable"
+        assert "EHOSTUNREACH" in detail and "no ARP reply" in detail and "192.168.2.220:443" in detail
+
+    async def test_connection_refused(self):
+        with patch("chaos.asyncio.open_connection", AsyncMock(side_effect=ConnectionRefusedError(errno.ECONNREFUSED, "refused"))):
+            short, detail = await _probeSite("h")
+        assert short == "connection refused"
+        assert "nothing is listening" in detail
+
+    async def test_timeout_means_dropped(self):
+        with patch("chaos.asyncio.open_connection", AsyncMock(side_effect=asyncio.TimeoutError)):
+            short, detail = await _probeSite("h")
+        assert short == "TCP timeout"
+        assert "firewall/VLAN" in detail
+
+    async def test_dns_failure(self):
+        with patch("chaos.asyncio.open_connection", AsyncMock(side_effect=socket.gaierror(8, "nodename nor servname"))):
+            short, _ = await _probeSite("gateway.local")
+        assert short == "DNS lookup failed"
+
+    async def test_unknown_errno_reports_its_name(self):
+        with patch("chaos.asyncio.open_connection", AsyncMock(side_effect=OSError(errno.EACCES, "Permission denied"))):
+            short, detail = await _probeSite("h")
+        assert short == "EACCES"
+        assert "Permission denied" in detail
+
+    async def _probeWithHttp(self, handler):
+        realClient = httpx.AsyncClient
+        transport = httpx.MockTransport(handler)
+        with (
+            patch("chaos.asyncio.open_connection", AsyncMock(return_value=(MagicMock(), _fakeWriter()))),
+            patch("chaos.httpx.AsyncClient", lambda **kw: realClient(transport=transport)),
+        ):
+            return await _probeSite("h")
+
+    async def test_https_200_reports_status_fields(self):
+        short, detail = await self._probeWithHttp(
+            lambda req: httpx.Response(200, json={"version": "25.10.1", "up_time": "3m2s", "din": "1232100-00-E--TG1"}))
+        assert short == "gateway reachable"
+        assert "connected in" in detail and "HTTPS /api/status 200" in detail
+        assert "version=25.10.1" in detail and "up_time=3m2s" in detail
+        assert "API/auth layer" in detail
+
+    async def test_https_403_still_reachable(self):
+        short, detail = await self._probeWithHttp(lambda req: httpx.Response(403))
+        assert short == "gateway reachable"
+        assert "HTTPS /api/status 403" in detail
+
+    async def test_https_connect_error(self):
+        def handler(req):
+            raise httpx.ConnectError("SSL: WRONG_VERSION_NUMBER")
+        short, detail = await self._probeWithHttp(handler)
+        assert short == "HTTPS failed"
+        assert "ConnectError" in detail and "WRONG_VERSION_NUMBER" in detail
+
+    async def test_https_timeout(self):
+        def handler(req):
+            raise httpx.ReadTimeout("slow")
+        short, _ = await self._probeWithHttp(handler)
+        assert short == "HTTPS timeout"
+
+
+class TestPypowerwallCapture:
+    def test_captures_debug_failure_message(self):
+        def read():
+            logging.getLogger("pypowerwall.local.pypowerwall_local").debug(" -- local: Request Powerwall for /api/x")
+            logging.getLogger("pypowerwall.local.pypowerwall_local").debug("ERROR Timeout waiting for Powerwall API https://h/api/x")
+            return 42
+        assert _pypowerwallCapture.runCapturing(read) == (42, "ERROR Timeout waiting for Powerwall API https://h/api/x")
+
+    def test_no_message_when_nothing_logged(self):
+        assert _pypowerwallCapture.runCapturing(lambda: 1) == (1, None)
+
+    def test_ignores_records_from_other_threads(self):
+        def other():
+            logging.getLogger("pypowerwall.local").error("ERROR from another site's thread")
+        def read():
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            return 0
+        assert _pypowerwallCapture.runCapturing(read) == (0, None)
+
+    def test_debug_records_do_not_reach_log_handlers(self):
+        assert all(h.level >= logging.INFO for h in logging.getLogger().handlers
+                   if isinstance(h, (logging.FileHandler, logging.StreamHandler))
+                   and not type(h).__name__.startswith("LogCapture"))
+
+
+@pytest.mark.asyncio
+class TestPollFailureDiagnostics:
+    def _zero_pw(self, message=None):
+        pw = MagicMock()
+        def solar():
+            if message:
+                logging.getLogger("pypowerwall.local.pypowerwall_local").debug(message)
+            return None
+        pw.solar.side_effect = solar
+        pw.home.return_value = None
+        pw.level.return_value = None
+        return pw
+
+    async def test_all_zero_includes_probe_and_pypowerwall_reason(self, _noRealSiteProbe, caplog):
+        site = SiteInfo(name="Cohiba1", pw=self._zero_pw("ERROR Timeout waiting for Powerwall API https://x"),
+                        pwConfig={"host": "192.168.2.220"})
+        with caplog.at_level(logging.WARNING, logger="chaos"), patch("chaos.fireWebhook"):
+            assert await _pollOneSite(site) is False
+        _noRealSiteProbe.assert_awaited_once_with("192.168.2.220")
+        assert site.error == "All-zero reading — probe-short"
+        line = next(r.getMessage() for r in caplog.records if "Poll failed" in r.getMessage())
+        assert "[Powerwall:Cohiba1]" in line
+        assert "pypowerwall: ERROR Timeout waiting for Powerwall API" in line
+        assert "probe: probe-detail" in line
+        assert "down 0m (1 polls)" in line
+
+    async def test_no_probe_without_host(self, _noRealSiteProbe):
+        site = SiteInfo(name="Site", pw=self._zero_pw())
+        await _pollOneSite(site)
+        _noRealSiteProbe.assert_not_awaited()
+        assert site.error == "All-zero reading"
+
+    async def test_exception_is_diagnosed(self):
+        pw = MagicMock()
+        pw.solar.side_effect = ConnectionResetError("reset by peer")
+        site = SiteInfo(name="Site", pw=pw, pwConfig={"host": "h"})
+        assert await _pollOneSite(site) is False
+        assert site.error == "ConnectionResetError: reset by peer — probe-short"
+
+    async def test_outage_duration_tracked_and_reported(self, caplog):
+        site = SiteInfo(name="Site", pw=self._zero_pw(), pwConfig={"host": "h"})
+        fired = []
+        with (
+            patch("chaos._webhookUrl", "https://hook.example.com"),
+            patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)),
+        ):
+            await _pollOneSite(site)
+            start = site.firstFailureTime
+            assert start is not None
+            site.firstFailureTime = start - timedelta(hours=101, minutes=12)
+            for _ in range(_SITE_UNREACHABLE_NOTIFY_CYCLES - 1):
+                await _pollOneSite(site)
+            assert fired[0]["event"] == "site_unreachable"
+            assert fired[0]["diagnosis"] == "probe-detail"
+            assert fired[0]["downSince"] == site.firstFailureTime.isoformat()
+            assert "Diagnosis: probe-detail" in fired[0]["text"]
+
+            site.pw = MagicMock()
+            site.pw.solar.return_value = 1000
+            site.pw.home.return_value = 500
+            site.pw.level.return_value = 80
+            with caplog.at_level(logging.INFO, logger="chaos"):
+                assert await _pollOneSite(site) is True
+        assert fired[-1]["event"] == "site_recovered"
+        assert fired[-1]["downtimeSeconds"] >= 101 * 3600 + 12 * 60
+        assert "after 101h 12m" in fired[-1]["text"]
+        assert any("down 101h 12m" in r.getMessage() for r in caplog.records)
+        assert site.firstFailureTime is None
+
+    async def test_brief_failure_logs_recovery_without_webhook(self, caplog):
+        site = SiteInfo(name="Site", pw=self._zero_pw())
+        await _pollOneSite(site)
+        site.pw = MagicMock()
+        site.pw.solar.return_value = 1000
+        site.pw.home.return_value = 500
+        site.pw.level.return_value = 80
+        with caplog.at_level(logging.INFO, logger="chaos"), patch("chaos.fireWebhook") as fire:
+            assert await _pollOneSite(site) is True
+        fire.assert_not_called()
+        assert any("Reachable again after 1 failed polls" in r.getMessage() for r in caplog.records)
+
+
+class TestSiteWebhookPayloads:
+    def test_unreachable_without_diagnosis(self):
+        payload = _siteUnreachablePayload("S", "err", 5, None, None)
+        assert payload["diagnosis"] is None and payload["downSince"] is None
+        assert "Diagnosis" not in payload["text"]
+
+    def test_recovered_without_downtime(self):
+        payload = _siteRecoveredPayload("S", None)
+        assert payload["downtimeSeconds"] is None
+        assert payload["text"].endswith("reachable again")
+
+
+# ---------------------------------------------------------------------------
+# _checkBothFullNotify — EV-at-target + Powerwall-full webhook notification
+# ---------------------------------------------------------------------------
+
+class TestBothFullWebhook:
+    def _site(self, powerwallSocPercent: float) -> SiteInfo:
+        site = SiteInfo(name="Site", pw=None)
+        site.pwState.powerwallSocPercent = powerwallSocPercent
+        return site
+
+    def test_no_fire_when_ev_below_target(self):
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=60, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert fired == []
+        assert site.bothFullNotified is False
+
+    def test_no_fire_when_pw_below_full(self):
+        site = self._site(powerwallSocPercent=95)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=80, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert fired == []
+        assert site.bothFullNotified is False
+
+    def test_no_fire_when_ev_soc_is_none(self):
+        """Before the EV has ever been polled (startup), evSocPercent is None."""
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=None, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert fired == []
+        assert site.bothFullNotified is False
+
+    def test_fires_once_when_both_full(self):
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=70, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert len(fired) == 1
+        assert fired[0]["event"] == "ev_and_powerwall_full"
+        assert fired[0]["site"] == "Site"
+        assert fired[0]["evSocPercent"] == 70
+        assert fired[0]["powerwallSocPercent"] == 100
+        assert site.bothFullNotified is True
+
+    def test_does_not_refire_while_still_both_full(self):
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            for _ in range(3):
+                _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert len(fired) == 1
+
+    def test_resets_and_refires_after_condition_breaks(self):
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+            assert len(fired) == 1
+            assert site.bothFullNotified is True
+
+            # Powerwall discharges overnight below the full threshold.
+            site.pwState.powerwallSocPercent = 90
+            _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+            assert len(fired) == 1
+            assert site.bothFullNotified is False
+
+            # Powerwall fills back up the next day — fires again.
+            site.pwState.powerwallSocPercent = 100
+            _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert len(fired) == 2
+        assert site.bothFullNotified is True
+
+    def test_small_dips_do_not_rearm(self):
+        """A full Powerwall wobbling 100 → 99.5 → 100 (or EV hovering at target) must not
+        refire; only a drop past _BOTH_FULL_RESET_MARGIN_PCT re-arms the alert."""
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            for pwSoc, evSoc in [(100, 70), (99.5, 70), (100, 70), (100, 68), (100, 70)]:
+                site.pwState.powerwallSocPercent = pwSoc
+                _checkBothFullNotify(site, evSocPercent=evSoc, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert len(fired) == 1
+        assert site.bothFullNotified is True
+
+    def test_ev_drop_past_margin_rearms(self):
+        site = self._site(powerwallSocPercent=100)
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            for evSoc in [70, 60, 70]:
+                _checkBothFullNotify(site, evSocPercent=evSoc, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+
+        assert len(fired) == 2
+
+    def test_skipped_when_site_poll_failed(self):
+        """A site whose poll just failed has stale readings — no fire, and the
+        notified flag is left untouched."""
+        site = self._site(powerwallSocPercent=100)
+        site.error = "All-zero reading (transient?)"
+        fired = []
+        with patch("chaos.fireWebhook", side_effect=lambda url, payload: fired.append(payload)):
+            _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+            assert fired == []
+            assert site.bothFullNotified is False
+
+            site.bothFullNotified = True
+            site.pwState.powerwallSocPercent = 50
+            _checkBothFullNotify(site, evSocPercent=75, targetEvChargePercent=70, powerwallFullSocPercent=100, webhookUrl="https://hook.example.com")
+            assert site.bothFullNotified is True
+
+
+# ---------------------------------------------------------------------------
 # processCycle — post-command factor boost
 # ---------------------------------------------------------------------------
 
@@ -2156,6 +2752,61 @@ class TestExternalCharge:
         result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
         assert result.lastActionDesc == "ext session — taking over"
 
+    async def test_observe_when_external_session_within_stop_cooldown(self, thresholds, pw_good):
+        """External session appears while still within the cooldown after a STOP →
+        OBSERVE (no command), even though interference is allowed. Regression test for
+        CHAOS immediately taking over and ADJUSTing a session that resumed seconds
+        after a stop, defeating commandCooldownMinutes."""
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 11
+        assert thresholds.allowExternalChargeInterference is True
+
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=0,
+            # Past _STOP_LAG_SECS (120s) so this is real external-session detection,
+            # not the API-lag guard — but still within commandCooldownMinutes (5 min).
+            lastCommandTime=datetime.now(timezone.utc) - timedelta(minutes=3),
+            lastCommandWasStart=False,
+        )
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        lucid.set_ac_current_limit.assert_not_awaited()
+        lucid.stop_charging.assert_not_awaited()
+        assert "cooldown" in result.lastActionDesc
+
+    async def test_takeover_when_external_session_cooldown_is_from_start(self, thresholds, pw_good):
+        """The cooldown-deferral only applies after a STOP. If the last command was a
+        START (e.g. HOLD_MIN's cooldown), an external session is still taken over normally."""
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=0,
+            lastCommandTime=datetime.now(timezone.utc) - timedelta(minutes=1),
+            lastCommandWasStart=True,
+        )
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert result.lastActionDesc == "ext session — taking over"
+
+    async def test_takeover_when_stop_cooldown_has_elapsed(self, thresholds, pw_good):
+        """Once the post-stop cooldown has fully elapsed, an external session is taken
+        over normally, as before this fix."""
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+
+        prev = VehicleState(
+            evSocPercent=50.0,
+            chargeState=CS.CHARGE_STATE_CHARGING,
+            evChargingAmps=0,
+            lastCommandTime=datetime.now(timezone.utc) - timedelta(minutes=thresholds.commandCooldownMinutes + 1),
+            lastCommandWasStart=False,
+        )
+        result = await pollVehicleAndDecide(lucid, pw_good, thresholds, "", prevState=prev)
+        assert result.lastActionDesc == "ext session — taking over"
+
     async def test_action_desc_shows_ext_session_observing(self, thresholds, pw_good):
         """External session with interference=False → ACTION shows 'ext session — observing'."""
         no_interference = ChargingThresholds(
@@ -2302,6 +2953,7 @@ class TestHTMLTemplate:
             "activePowerwall",
             "history",
             "targetEvChargePercent",
+            "lucidError",
         ):
             assert key in d, f"Missing key '{key}' in /api/state response"
 
@@ -2375,6 +3027,71 @@ class TestWritePowerwallToConfig:
             _writePowerwallToConfig("Garage", path=str(cfg_file))
             mock_replace.assert_not_called()
         assert json.loads(cfg_file.read_text())["activePowerwall"] == "Garage"
+
+
+# ---------------------------------------------------------------------------
+# _writeChargingModeToConfig
+# ---------------------------------------------------------------------------
+
+class TestWriteChargingModeToConfig:
+    """Tests for the config.json chargingMode persistence helper.
+
+    Regression coverage: chargingMode used to live only in the in-memory
+    _chargingMode global, so a process restart while charging was disabled
+    silently re-enabled it (CHAOS would start charging on the next cycle with
+    no indication the user's disable had been forgotten)."""
+
+    def test_writes_charging_mode_disabled(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"charging": {"minChargingAmps": 12}}))
+        _writeChargingModeToConfig(ChargingMode.DISABLED, path=str(cfg_file))
+        saved = json.loads(cfg_file.read_text())
+        assert saved["charging"]["chargingMode"] == "disabled"
+        assert saved["charging"]["minChargingAmps"] == 12  # other charging keys preserved
+
+    def test_writes_charging_mode_enabled(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"charging": {"chargingMode": "disabled"}}))
+        _writeChargingModeToConfig(ChargingMode.ENABLED, path=str(cfg_file))
+        saved = json.loads(cfg_file.read_text())
+        assert saved["charging"]["chargingMode"] == "enabled"
+
+    def test_writes_charging_mode_manual(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"charging": {"chargingMode": "enabled"}}))
+        _writeChargingModeToConfig(ChargingMode.MANUAL, path=str(cfg_file))
+        saved = json.loads(cfg_file.read_text())
+        assert saved["charging"]["chargingMode"] == "manual"
+
+    def test_creates_charging_section_if_missing(self, tmp_path):
+        """Config missing the 'charging' block entirely (shouldn't happen given
+        _validateConfig, but keep the writer defensive) still gets the key set."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"activePowerwall": "Home"}))
+        _writeChargingModeToConfig(ChargingMode.DISABLED, path=str(cfg_file))
+        saved = json.loads(cfg_file.read_text())
+        assert saved["charging"]["chargingMode"] == "disabled"
+
+    def test_preserves_other_root_keys(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"charging": {}, "pollingIntervalSeconds": 60, "extra": "value"}))
+        _writeChargingModeToConfig(ChargingMode.ENABLED, path=str(cfg_file))
+        saved = json.loads(cfg_file.read_text())
+        assert saved["pollingIntervalSeconds"] == 60
+        assert saved["extra"] == "value"
+
+    def test_missing_file_logs_warning_does_not_raise(self, tmp_path):
+        _writeChargingModeToConfig(ChargingMode.DISABLED, path=str(tmp_path / "nonexistent.json"))
+        # no exception
+
+    def test_no_rename_over_bind_mount(self, tmp_path):
+        """Does not use Path.replace() — avoids EBUSY on Docker bind mounts on Linux/Synology."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"charging": {}}))
+        with patch("pathlib.Path.replace") as mock_replace:
+            _writeChargingModeToConfig(ChargingMode.DISABLED, path=str(cfg_file))
+            mock_replace.assert_not_called()
+        assert json.loads(cfg_file.read_text())["charging"]["chargingMode"] == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -2635,7 +3352,7 @@ class TestSiteInfoHistory:
 
 @pytest.mark.asyncio
 class TestprocessCycleSolarRollingAverage:
-    """Verify the rolling 3-sample solar average smooths out transient dips."""
+    """Verify the rolling 5-sample solar average smooths out transient dips."""
 
     async def test_single_sample_advances_history(self, thresholds):
         """After one update the persistent PowerwallState history has one entry."""
@@ -2647,9 +3364,9 @@ class TestprocessCycleSolarRollingAverage:
 
     async def test_transient_solar_dip_does_not_trigger_stop(self, thresholds):
         """
-        If solar was high for 2 cycles then drops to 0 on cycle 3, the rolling
-        average (mean of [3000, 3000, 0] = 2000 W) still exceeds minSurplusKw
-        (~0.5 kW), so charging should NOT be stopped.
+        If solar was high for 4 cycles then drops to 0 on cycle 5, the rolling
+        average (mean of [3000, 3000, 3000, 3000, 0] = 2400 W) still exceeds
+        minSurplusKw (~0.5 kW), so charging should NOT be stopped.
         """
 
         charging_state = VehicleState(
@@ -2666,14 +3383,13 @@ class TestprocessCycleSolarRollingAverage:
             with patch("chaos.pollVehicleAndDecide", pvad):
                 return await processCycle(lucid, thresholds, "", {}, cached, pwState=pwState)
 
-        pvad.reset_mock()
-        cached, _ = await run_cycle(3000, 500, 80.0, None)
+        cached = None
+        for _ in range(4):
+            pvad.reset_mock()
+            pvad.return_value = charging_state
+            cached, _ = await run_cycle(3000, 500, 80.0, cached)
 
-        pvad.reset_mock()
-        pvad.return_value = charging_state
-        cached, _ = await run_cycle(3000, 500, 80.0, charging_state)
-
-        # Cycle 3: transient zero solar — raw=0, avg=(3000+3000+0)/3=2000W
+        # Cycle 5: transient zero solar — raw=0, avg=(3000*4+0)/5=2400W
         # isActivelyCharging=True so skip guard is bypassed; pvad is always called.
         pvad.reset_mock()
         pvad.return_value = charging_state
@@ -2686,19 +3402,19 @@ class TestprocessCycleSolarRollingAverage:
         )
 
     async def test_history_rolls_off_oldest_sample(self, thresholds):
-        """After maxlen=3 samples the oldest is evicted and the average reflects the latest 3."""
+        """After maxlen=5 samples the oldest is evicted and the average reflects the latest 5."""
         returned = VehicleState(evSocPercent=50.0, chargeState=0)
         lucid = _make_lucid_processCycle_mock()
         pwState = PowerwallState()
 
-        for solar in [3000, 3000, 3000, 0]:
+        for solar in [3000, 3000, 3000, 3000, 3000, 0]:
             pwState.update(solar, 500, 80.0)
             with patch("chaos.pollVehicleAndDecide", AsyncMock(return_value=returned)):
                 await processCycle(lucid, thresholds, "", {}, None, pwState=pwState)
 
-        # After 4 cycles maxlen=3 keeps [3000, 3000, 0]
-        assert list(pwState._solarHistory) == [3000, 3000, 0]
-        assert pwState.avgSolarWatts == pytest.approx(2000)
+        # After 6 cycles maxlen=5 keeps [3000, 3000, 3000, 3000, 0]
+        assert list(pwState._solarHistory) == [3000, 3000, 3000, 3000, 0]
+        assert pwState.avgSolarWatts == pytest.approx(2400)
 
 
 # ---------------------------------------------------------------------------
@@ -3200,6 +3916,38 @@ class TestBuildSiteReadings:
         allSites = self._sites({n: (0, 0, 0, None) for n in ["C", "A", "B"]})
         readings = _buildSiteReadings(allSites, "C")
         assert [r["name"] for r in readings] == ["C", "A", "B"]
+
+    def test_model_and_firmware_included(self):
+        allSites = self._sites({"Home": (1000, 500, 90, None)})
+        allSites["Home"].model = "Powerwall 3"
+        allSites["Home"].firmwareVersion = "25.10.1"
+        r = _buildSiteReadings(allSites, "Home")[0]
+        assert r["model"] == "Powerwall 3"
+        assert r["firmwareVersion"] == "25.10.1"
+
+    def test_tesla_charging_kw_included(self):
+        allSites = self._sites({"Home": (1000, 500, 90, None)})
+        r = _buildSiteReadings(allSites, "Home")[0]
+        assert r["teslaChargingKw"] == 0.0  # tesla unconfigured → no attribution
+
+    def test_lifetime_energy_included(self):
+        allSites = self._sites({"Home": (1000, 500, 90, None)})
+        allSites["Home"].lifetimeChargedWh = 18_200_000.0
+        allSites["Home"].lifetimeDischargedWh = 17_100_000.0
+        r = _buildSiteReadings(allSites, "Home")[0]
+        assert r["lifetimeChargedWh"] == 18_200_000.0
+        assert r["lifetimeDischargedWh"] == 17_100_000.0
+
+    def test_last_polled_from_history(self):
+        allSites = self._sites({"Home": (1000, 500, 90, None)})
+        allSites["Home"].history.append({"timestamp": "2026-07-15T10:00:00+00:00"})
+        readings = _buildSiteReadings(allSites, "Home")
+        assert readings[0]["lastPolled"] == "2026-07-15T10:00:00+00:00"
+
+    def test_last_polled_none_without_history(self):
+        allSites = self._sites({"Home": (1000, 500, 90, None)})
+        readings = _buildSiteReadings(allSites, "Home")
+        assert readings[0]["lastPolled"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -3708,15 +4456,15 @@ class TestDetectSiteSwitch:
 # ---------------------------------------------------------------------------
 
 class TestChargingDisabled:
-    """Tests for _decideChargingAction with chargingEnabled=False."""
+    """Tests for _decideChargingAction with chargingMode=ChargingMode.DISABLED."""
 
     def test_disabled_while_charging_gives_stop(self, thresholds, pw_good):
-        d = _decide(thresholds, pw_good, isCharging=True, targetAmps=16, chargingEnabled=False)
+        d = _decide(thresholds, pw_good, isCharging=True, targetAmps=16, chargingMode=ChargingMode.DISABLED)
         assert d.action == ChargingAction.STOP
         assert "disabled" in d.reason
 
     def test_disabled_while_not_charging_gives_none(self, thresholds, pw_good):
-        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingEnabled=False)
+        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingMode=ChargingMode.DISABLED)
         assert d.action == ChargingAction.NONE
         assert "disabled" in d.reason
 
@@ -3728,34 +4476,146 @@ class TestChargingDisabled:
             targetAmps=thresholds.minChargingAmps - 1,
             inCooldown=True,
             lastCommandWasStart=True,
-            chargingEnabled=False,
+            chargingMode=ChargingMode.DISABLED,
         )
         assert d.action == ChargingAction.STOP
 
-    def test_enabled_true_is_default_behaviour(self, thresholds, pw_good):
-        """Explicit chargingEnabled=True should behave identically to the default."""
-        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingEnabled=True)
+    def test_enabled_is_default_behaviour(self, thresholds, pw_good):
+        """Explicit chargingMode=ChargingMode.ENABLED should behave identically to the default."""
+        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingMode=ChargingMode.ENABLED)
         assert d.action == ChargingAction.START
 
     @pytest.mark.asyncio
-    async def test_disabled_uses_ev_done_poll_factor(self, thresholds, pw_good):
-        """Charging disabled → processCycle skips EV poll with factor == _INTERVAL_EV_DONE."""
+    async def test_disabled_still_polls_at_normal_cadence(self, thresholds, pw_good):
+        """Charging disabled must NOT make processCycle skip the Lucid poll — otherwise
+        CHAOS can never notice (or stop) a session started through some other channel
+        while disabled. Regression test: this used to skip with factor=_INTERVAL_EV_DONE."""
         import chaos
         from chaos import processCycle, _INTERVAL_EV_DONE
 
-        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
-        pvad = AsyncMock()
-        chaos._chargingEnabled = False
+        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED, lastCommandTime=None)
+        polled = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED, lastCommandTime=None)
+        pvad = AsyncMock(return_value=polled)
+        chaos._chargingMode = ChargingMode.DISABLED
         try:
             with patch("chaos.pollVehicleAndDecide", pvad):
                 _, factor = await processCycle(
                     _make_lucid_processCycle_mock(), thresholds, "",
                     {"username": "u", "password": "p"}, cached, pwState=pw_good,
                 )
-            pvad.assert_not_awaited()
+            pvad.assert_awaited_once()
+            assert factor != _INTERVAL_EV_DONE
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
+
+    @pytest.mark.asyncio
+    async def test_disabled_detects_and_stops_external_session(self, thresholds, pw_good):
+        """The actual bug scenario this fixes: charging is disabled but the EV is
+        externally charging (Lucid app / a schedule) while CHAOS's cached state still
+        thinks it's idle. processCycle must poll Lucid (not skip) and issue the STOP."""
+        import chaos
+
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+        lucid.session_time_remaining = MagicMock()
+        lucid.session_time_remaining.total_seconds.return_value = 300
+
+        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED, evChargingAmps=0)
+        chaos._chargingMode = ChargingMode.DISABLED
+        try:
+            result, _ = await processCycle(
+                lucid, thresholds, "", {"username": "u", "password": "p"}, cached, pwState=pw_good,
+            )
+            lucid.stop_charging.assert_awaited_once()
+            assert result.chargeState == CS.CHARGE_STATE_CHARGING_STOPPED
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
+
+    @pytest.mark.asyncio
+    async def test_disabled_idle_shows_charging_disabled_in_dashboard(self, thresholds, pw_good):
+        """Idle + disabled must still surface 'charging disabled' in the dashboard Action
+        column, now that it's produced by the decision reason rather than skipReason."""
+        import chaos
+
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CABLE_CONNECTED)
+        lucid.session_time_remaining = MagicMock()
+        lucid.session_time_remaining.total_seconds.return_value = 300
+
+        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED, evChargingAmps=0)
+        chaos._chargingMode = ChargingMode.DISABLED
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t"})
+        try:
+            await processCycle(
+                lucid, thresholds, "", {"username": "u", "password": "p"}, cached,
+                dashState=chaos._dashboard, pwState=pw_good,
+            )
+            assert chaos._dashboard.history[-1]["action"] == "charging disabled"
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
+
+
+class TestChargingManual:
+    """Tests for _decideChargingAction / processCycle with chargingMode=ChargingMode.MANUAL."""
+
+    def test_manual_while_charging_gives_none_not_stop(self, thresholds, pw_good):
+        """Core new behavior: manual mode never stops an active session, even
+        though a normal STOP condition (low surplus) would otherwise apply."""
+        d = _decide(
+            thresholds, pw_good,
+            isCharging=True,
+            targetAmps=thresholds.minChargingAmps - 1,
+            chargingMode=ChargingMode.MANUAL,
+        )
+        assert d.action == ChargingAction.NONE
+        assert "manual" in d.reason
+
+    def test_manual_while_not_charging_gives_none_not_start(self, thresholds, pw_good):
+        """Manual mode never starts a session either, even when conditions allow it."""
+        d = _decide(thresholds, pw_good, canCharge=True, targetAmps=16, chargingMode=ChargingMode.MANUAL)
+        assert d.action == ChargingAction.NONE
+        assert "manual" in d.reason
+
+    @pytest.mark.asyncio
+    async def test_manual_uses_normal_skip_poll_cadence(self, thresholds, pw_good):
+        """Unlike disabled, manual mode never issues STOP, so it doesn't need constant
+        polling to catch external sessions — it uses the same skip cadence as enabled."""
+        import chaos
+        from chaos import processCycle, _INTERVAL_EV_DONE
+
+        cached = VehicleState(
+            evSocPercent=99.0, chargeState=CS.CHARGE_STATE_CABLE_CONNECTED, lastCommandTime=None,
+        )
+        chaos._chargingMode = ChargingMode.MANUAL
+        try:
+            _, factor = await processCycle(
+                _make_lucid_processCycle_mock(), thresholds, "",
+                {"username": "u", "password": "p"}, cached, pwState=pw_good,
+            )
             assert factor == _INTERVAL_EV_DONE
         finally:
-            chaos._chargingEnabled = True
+            chaos._chargingMode = ChargingMode.ENABLED
+
+    @pytest.mark.asyncio
+    async def test_manual_does_not_stop_active_session(self, thresholds, pw_good):
+        """While a session is actively charging, switching to manual leaves it running
+        untouched — no STOP is ever sent."""
+        import chaos
+
+        lucid, vehicle = _make_lucid_mock(chargeState=CS.CHARGE_STATE_CHARGING)
+        vehicle.state.charging.active_session_ac_current_limit = 20
+        lucid.session_time_remaining = MagicMock()
+        lucid.session_time_remaining.total_seconds.return_value = 300
+
+        cached = VehicleState(evSocPercent=50.0, chargeState=CS.CHARGE_STATE_CHARGING, evChargingAmps=20)
+        chaos._chargingMode = ChargingMode.MANUAL
+        try:
+            await processCycle(
+                lucid, thresholds, "", {"username": "u", "password": "p"}, cached, pwState=pw_good,
+            )
+            lucid.stop_charging.assert_not_awaited()
+        finally:
+            chaos._chargingMode = ChargingMode.ENABLED
 
 
 class TestWebApiCharging:
@@ -3765,42 +4625,69 @@ class TestWebApiCharging:
         import chaos
         from starlette.testclient import TestClient
 
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
         chaos._dashboard.history.clear()
         chaos._dashboard.history.append({"timestamp": "t", "action": "adjust 10→12A"})
         with caplog.at_level(logging.INFO, logger="chaos"):
-            with TestClient(_webApp) as client:
-                r = client.post("/api/charging", json={"enabled": False})
+            with patch("chaos._writeChargingModeToConfig") as mock_write:
+                with TestClient(_webApp) as client:
+                    r = client.post("/api/charging", json={"mode": "disabled"})
         assert r.status_code == 200
-        assert r.json() == {"ok": True, "chargingEnabled": False}
-        assert chaos._chargingEnabled is False
+        assert r.json() == {"ok": True, "chargingMode": "disabled"}
+        assert chaos._chargingMode is ChargingMode.DISABLED
         assert chaos._forcePoll.is_set()
         assert any("disabled" in m for m in caplog.messages)
         assert chaos._dashboard.history[-1]["action"] == "charging disabled • adjust 10→12A"
+        mock_write.assert_called_once_with(ChargingMode.DISABLED)
         # cleanup
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
 
     def test_enable_sets_global_triggers_poll_and_logs(self, caplog):
         import chaos
         from starlette.testclient import TestClient
 
-        chaos._chargingEnabled = False
+        chaos._chargingMode = ChargingMode.DISABLED
         chaos._forcePoll.clear()
         chaos._dashboard.history.clear()
         chaos._dashboard.history.append({"timestamp": "t", "action": ""})
         with caplog.at_level(logging.INFO, logger="chaos"):
-            with TestClient(_webApp) as client:
-                r = client.post("/api/charging", json={"enabled": True})
+            with patch("chaos._writeChargingModeToConfig") as mock_write:
+                with TestClient(_webApp) as client:
+                    r = client.post("/api/charging", json={"mode": "enabled"})
         assert r.status_code == 200
-        assert r.json() == {"ok": True, "chargingEnabled": True}
-        assert chaos._chargingEnabled is True
+        assert r.json() == {"ok": True, "chargingMode": "enabled"}
+        assert chaos._chargingMode is ChargingMode.ENABLED
         assert chaos._forcePoll.is_set()
         assert any("enabled" in m for m in caplog.messages)
         assert chaos._dashboard.history[-1]["action"] == "charging enabled"
+        mock_write.assert_called_once_with(ChargingMode.ENABLED)
         # cleanup
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
+        chaos._forcePoll.clear()
+
+    def test_manual_sets_global_triggers_poll_and_logs(self, caplog):
+        """Round-trip test for the new manual mode."""
+        import chaos
+        from starlette.testclient import TestClient
+
+        chaos._chargingMode = ChargingMode.ENABLED
+        chaos._forcePoll.clear()
+        chaos._dashboard.history.clear()
+        chaos._dashboard.history.append({"timestamp": "t", "action": ""})
+        with caplog.at_level(logging.INFO, logger="chaos"):
+            with patch("chaos._writeChargingModeToConfig") as mock_write:
+                with TestClient(_webApp) as client:
+                    r = client.post("/api/charging", json={"mode": "manual"})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "chargingMode": "manual"}
+        assert chaos._chargingMode is ChargingMode.MANUAL
+        assert chaos._forcePoll.is_set()
+        assert chaos._dashboard.history[-1]["action"] == "charging set to manual (monitor only)"
+        mock_write.assert_called_once_with(ChargingMode.MANUAL)
+        # cleanup
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
 
     def test_no_change_skips_log_and_poll(self, caplog):
@@ -3808,15 +4695,15 @@ class TestWebApiCharging:
         import chaos
         from starlette.testclient import TestClient
 
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
         chaos._dashboard.history.clear()
         chaos._dashboard.history.append({"timestamp": "t", "action": "hold min"})
         with caplog.at_level(logging.INFO, logger="chaos"):
             with TestClient(_webApp) as client:
-                r = client.post("/api/charging", json={"enabled": True})
+                r = client.post("/api/charging", json={"mode": "enabled"})
         assert r.status_code == 200
-        assert r.json() == {"ok": True, "chargingEnabled": True}
+        assert r.json() == {"ok": True, "chargingMode": "enabled"}
         assert not chaos._forcePoll.is_set()
         assert not any("enabled" in m or "disabled" in m for m in caplog.messages)
         assert chaos._dashboard.history[-1]["action"] == "hold min"  # unchanged
@@ -3826,24 +4713,1227 @@ class TestWebApiCharging:
         import chaos
         from starlette.testclient import TestClient
 
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
         chaos._dashboard.history.clear()
         chaos._dashboard.history.append({"timestamp": "t"})  # no 'action' key
-        with TestClient(_webApp) as client:
-            r = client.post("/api/charging", json={"enabled": False})
+        with patch("chaos._writeChargingModeToConfig"):
+            with TestClient(_webApp) as client:
+                r = client.post("/api/charging", json={"mode": "disabled"})
         assert r.status_code == 200
         assert chaos._dashboard.history[-1]["action"] == "charging disabled"
         # cleanup
-        chaos._chargingEnabled = True
+        chaos._chargingMode = ChargingMode.ENABLED
         chaos._forcePoll.clear()
 
-    def test_non_bool_returns_400(self):
+    def test_invalid_mode_returns_400(self):
         from starlette.testclient import TestClient
         with TestClient(_webApp) as client:
-            r = client.post("/api/charging", json={"enabled": "yes"})
+            r = client.post("/api/charging", json={"mode": "yes"})
         assert r.status_code == 400
-        from starlette.testclient import TestClient
         with TestClient(_webApp) as client:
             r = client.post("/api/charging", json={})
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Tesla read-only integration
+# ---------------------------------------------------------------------------
+
+class _FakeTeslaVehicle(dict):
+    """Minimal stand-in for teslapy.Vehicle (a dict subclass with methods)."""
+
+    def __init__(self, vin="VIN1", name="Karl", state="online", chargeState=None, dataRaises=None,
+                 vehicleState=None, vehicleConfig=None):
+        super().__init__({"vin": vin, "display_name": name, "state": state})
+        self._chargeState = chargeState if chargeState is not None else {}
+        self._vehicleState = vehicleState if vehicleState is not None else {}
+        self._vehicleConfig = vehicleConfig if vehicleConfig is not None else {}
+        self._dataRaises = dataRaises
+        self.dataCalls = 0
+
+    def get_vehicle_data(self):
+        self.dataCalls += 1
+        if self._dataRaises:
+            raise self._dataRaises
+        return {"display_name": self["display_name"], "charge_state": self._chargeState,
+                "vehicle_state": self._vehicleState, "vehicle_config": self._vehicleConfig}
+
+
+def _make_tesla(vehicles=None, authorized=True):
+    tesla = MagicMock()
+    tesla.authorized = authorized
+    tesla.vehicle_list.return_value = vehicles if vehicles is not None else []
+    return tesla
+
+
+_ONLINE_CHARGE_STATE = {
+    "battery_level": 72,
+    "charging_state": "Charging",
+    "charger_power": 11,
+    "battery_range": 100.0,
+    "charge_limit_soc": 80,
+}
+
+
+@contextmanager
+def _tesla_dashboard(configured=True, vehicles=None):
+    """Temporarily set the module-global _dashboard Tesla fields, restoring after."""
+    import chaos
+    orig = (
+        chaos._dashboard.teslaConfigured,
+        chaos._dashboard.teslaAvailable,
+        chaos._dashboard.teslaError,
+        chaos._dashboard.teslaVehicles,
+        chaos._teslaFailed,
+    )
+    chaos._dashboard.teslaConfigured = configured
+    chaos._dashboard.teslaAvailable = True
+    chaos._dashboard.teslaError = None
+    chaos._dashboard.teslaVehicles = list(vehicles or [])
+    chaos._teslaFailed = False
+    try:
+        yield chaos._dashboard
+    finally:
+        (
+            chaos._dashboard.teslaConfigured,
+            chaos._dashboard.teslaAvailable,
+            chaos._dashboard.teslaError,
+            chaos._dashboard.teslaVehicles,
+            chaos._teslaFailed,
+        ) = orig
+
+
+class TestTeslaConfigValidation:
+    """_validateConfig handling of the optional tesla block."""
+
+    def test_absent_block_passes(self):
+        _validateConfig(_make_valid_config())
+
+    def test_disabled_block_without_email_passes(self):
+        _validateConfig(_make_valid_config(tesla={"enabled": False}))
+
+    def test_enabled_block_without_email_raises(self):
+        with pytest.raises(RuntimeError, match=r"config\['tesla'\]"):
+            _validateConfig(_make_valid_config(tesla={"enabled": True}))
+
+    def test_enabled_defaults_true_without_email_raises(self):
+        with pytest.raises(RuntimeError, match=r"config\['tesla'\]"):
+            _validateConfig(_make_valid_config(tesla={}))
+
+    def test_vehicle_names_must_be_list(self):
+        with pytest.raises(RuntimeError, match="vehicleNames"):
+            _validateConfig(_make_valid_config(tesla={"email": "e@e.com", "vehicleNames": "Karl"}))
+
+    def test_vehicle_names_must_be_non_empty_strings(self):
+        with pytest.raises(RuntimeError, match="vehicleNames"):
+            _validateConfig(_make_valid_config(tesla={"email": "e@e.com", "vehicleNames": ["Karl", ""]}))
+
+    def test_valid_block_passes(self):
+        _validateConfig(_make_valid_config(tesla={"email": "e@e.com", "vehicleNames": ["Karl"], "pollIntervalSeconds": 300}))
+
+    def test_poll_interval_must_be_positive_number(self):
+        for bad in ("300", 0, -5, True):
+            with pytest.raises(RuntimeError, match="pollIntervalSeconds"):
+                _validateConfig(_make_valid_config(tesla={"email": "e@e.com", "pollIntervalSeconds": bad}))
+
+
+class TestTeslaEnabled:
+    def test_absent_block_disabled(self):
+        assert _teslaEnabled({}) is False
+
+    def test_email_present_enabled(self):
+        assert _teslaEnabled({"tesla": {"email": "e@e.com"}}) is True
+
+    def test_explicitly_disabled(self):
+        assert _teslaEnabled({"tesla": {"email": "e@e.com", "enabled": False}}) is False
+
+    def test_empty_email_disabled(self):
+        assert _teslaEnabled({"tesla": {"email": ""}}) is False
+
+
+class TestTeslaReadVehicles:
+    """Sync teslapy reader — field mapping and the never-wake guarantee."""
+
+    def test_online_field_mapping(self):
+        v = _FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE,
+                              vehicleState={"odometer": 12000.0, "car_version": "2026.20.3 fae95c8"},
+                              vehicleConfig={"car_type": "modely"})
+        result = _teslaReadVehicles(_make_tesla([v]), [])
+        assert result["status"] == "ok"
+        (r,) = result["vehicles"]
+        assert r["status"] == "online"
+        assert r["vin"] == "VIN1"
+        assert r["name"] == "Karl"
+        assert r["socPercent"] == 72
+        assert r["chargeStateName"] == "Charging"
+        assert r["chargingKw"] == 11.0
+        assert r["rangeKm"] == pytest.approx(100.0 * _MILES_TO_KM, abs=0.1)
+        assert r["chargeLimitPercent"] == 80
+        assert r["model"] == "Model Y"
+        assert r["odometerKm"] == pytest.approx(12000.0 * _MILES_TO_KM, abs=0.1)
+        assert r["softwareVersion"] == "2026.20.3"  # build hash stripped
+
+    def test_unknown_car_type_and_missing_vehicle_state(self):
+        v = _FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE, vehicleConfig={"car_type": "roadster2"})
+        (r,) = _teslaReadVehicles(_make_tesla([v]), [])["vehicles"]
+        assert r["model"] == "roadster2"  # unmapped type displays raw
+        assert r["odometerKm"] is None
+        assert r["softwareVersion"] == ""
+
+    def test_platform_codenames_and_trim_badging(self):
+        """Refreshed S/X report internal codenames; trim badging is appended."""
+        cases = [
+            ({"car_type": "tamarind", "trim_badging": "plaid"}, "Model X Plaid"),
+            ({"car_type": "tamarind", "trim_badging": "p100d"}, "Model X Plaid"),  # refreshed X reports the internal code
+            ({"car_type": "lychee", "trim_badging": "plaid"}, "Model S Plaid"),
+            ({"car_type": "model3", "trim_badging": "p74d"}, "Model 3P"),
+            ({"car_type": "modely", "trim_badging": "p74d"}, "Model YP"),
+            ({"car_type": "models", "trim_badging": "p100d"}, "Model S P100D"),  # legacy platform: literal badge
+            ({"car_type": "model3", "trim_badging": "74d"}, "Model 3 74D"),      # non-performance badge unchanged
+            ({"car_type": "modely"}, "Model Y"),
+        ]
+        for vehicleConfig, expected in cases:
+            v = _FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE, vehicleConfig=vehicleConfig)
+            (r,) = _teslaReadVehicles(_make_tesla([v]), [])["vehicles"]
+            assert r["model"] == expected, f"{vehicleConfig} → {r['model']}"
+
+    def test_asleep_never_calls_get_vehicle_data(self):
+        v = _FakeTeslaVehicle(state="asleep")
+        result = _teslaReadVehicles(_make_tesla([v]), [])
+        (r,) = result["vehicles"]
+        assert r["status"] == "asleep"
+        assert v.dataCalls == 0
+
+    def test_offline_treated_as_asleep(self):
+        v = _FakeTeslaVehicle(state="offline")
+        (r,) = _teslaReadVehicles(_make_tesla([v]), [])["vehicles"]
+        assert r["status"] == "asleep"
+        assert v.dataCalls == 0
+
+    def test_mixed_fleet(self):
+        awake = _FakeTeslaVehicle(vin="V1", name="Karl", chargeState=_ONLINE_CHARGE_STATE)
+        sleeping = _FakeTeslaVehicle(vin="V2", name="Bella", state="asleep")
+        result = _teslaReadVehicles(_make_tesla([awake, sleeping]), [])
+        statuses = {r["vin"]: r["status"] for r in result["vehicles"]}
+        assert statuses == {"V1": "online", "V2": "asleep"}
+        assert sleeping.dataCalls == 0
+
+    def test_wanted_names_filter_and_order(self):
+        vs = [_FakeTeslaVehicle(vin=f"V{i}", name=n, state="asleep") for i, n in enumerate(("A", "B", "C"))]
+        result = _teslaReadVehicles(_make_tesla(vs), ["C", "A"])
+        assert [r["name"] for r in result["vehicles"]] == ["C", "A"]
+
+    def test_unknown_wanted_name_ignored(self):
+        vs = [_FakeTeslaVehicle(vin="V0", name="A", state="asleep")]
+        result = _teslaReadVehicles(_make_tesla(vs), ["A", "Nope"])
+        assert [r["name"] for r in result["vehicles"]] == ["A"]
+
+    def test_per_vehicle_data_error_reports_asleep(self):
+        """A 408 (car slept between list and data calls) must not fail the fleet."""
+        bad = _FakeTeslaVehicle(vin="V1", name="Karl", dataRaises=RuntimeError("408"))
+        good = _FakeTeslaVehicle(vin="V2", name="Bella", chargeState=_ONLINE_CHARGE_STATE)
+        result = _teslaReadVehicles(_make_tesla([bad, good]), [])
+        statuses = {r["vin"]: r["status"] for r in result["vehicles"]}
+        assert statuses == {"V1": "asleep", "V2": "online"}
+
+    def test_charger_power_none_coerced_to_zero(self):
+        cs = dict(_ONLINE_CHARGE_STATE, charger_power=None, battery_range=None)
+        (r,) = _teslaReadVehicles(_make_tesla([_FakeTeslaVehicle(chargeState=cs)]), [])["vehicles"]
+        assert r["chargingKw"] == 0.0
+        assert r["rangeKm"] is None
+
+    def test_unauthorized(self):
+        tesla = _make_tesla(authorized=False)
+        assert _teslaReadVehicles(tesla, [])["status"] == "unauthorized"
+        tesla._token_updater.assert_called_once()  # cache reload attempted first
+
+    def test_unauthorized_reloads_token_cache(self):
+        """A token written by --tesla-login while the daemon runs is picked up."""
+        tesla = _make_tesla([_FakeTeslaVehicle(state="asleep")], authorized=False)
+        def loadToken():
+            tesla.authorized = True
+        tesla._token_updater.side_effect = loadToken
+        assert _teslaReadVehicles(tesla, [])["status"] == "ok"
+
+    def test_wanted_names_no_match_returns_status(self):
+        vs = [_FakeTeslaVehicle(vin="V1", name="Karl", state="asleep")]
+        result = _teslaReadVehicles(_make_tesla(vs), ["Nope"])
+        assert result["status"] == "no_match"
+        assert result["accountNames"] == ["Karl"]
+
+    def test_no_vehicles(self):
+        assert _teslaReadVehicles(_make_tesla([]), [])["status"] == "no_vehicles"
+
+
+@pytest.mark.asyncio
+class TestPollTesla:
+    """Async wrapper — dashboard merge and error containment."""
+
+    async def test_online_updates_dashboard(self):
+        v = _FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE)
+        with _tesla_dashboard() as dash:
+            await pollTesla(_make_tesla([v]), {})
+            assert dash.teslaAvailable is True
+            assert dash.teslaError is None
+            (entry,) = dash.teslaVehicles
+            assert entry["socPercent"] == 72
+            assert entry["asleep"] is False
+            # lastPolled must be a recent ISO string
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(entry["lastPolled"])
+            assert age.total_seconds() < 10
+
+    async def test_asleep_keeps_last_known_values(self):
+        prev = {
+            "vin": "VIN1", "name": "Karl", "socPercent": 55, "chargeStateName": "Stopped",
+            "chargingKw": 0.0, "rangeKm": 200.0, "chargeLimitPercent": 80,
+            "asleep": False, "lastPolled": "2026-01-01T00:00:00+00:00",
+        }
+        v = _FakeTeslaVehicle(state="asleep")
+        with _tesla_dashboard(vehicles=[prev]) as dash:
+            await pollTesla(_make_tesla([v]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["asleep"] is True
+            assert entry["socPercent"] == 55
+            assert entry["rangeKm"] == 200.0
+            assert entry["lastPolled"] == "2026-01-01T00:00:00+00:00"
+        assert v.dataCalls == 0
+
+    async def test_asleep_with_no_previous_data_yields_placeholders(self):
+        v = _FakeTeslaVehicle(state="asleep")
+        with _tesla_dashboard() as dash:
+            await pollTesla(_make_tesla([v]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["asleep"] is True
+            assert entry["socPercent"] is None
+            assert entry["lastPolled"] is None
+
+    async def test_removed_vehicle_dropped(self):
+        prev = [
+            {"vin": "V1", "name": "Karl", "socPercent": 55, "chargeStateName": "", "chargingKw": 0.0,
+             "rangeKm": None, "chargeLimitPercent": None, "asleep": False, "lastPolled": None},
+            {"vin": "V2", "name": "Bella", "socPercent": 60, "chargeStateName": "", "chargingKw": 0.0,
+             "rangeKm": None, "chargeLimitPercent": None, "asleep": False, "lastPolled": None},
+        ]
+        with _tesla_dashboard(vehicles=prev) as dash:
+            await pollTesla(_make_tesla([_FakeTeslaVehicle(vin="V1", name="Karl", state="asleep")]), {})
+            assert [e["vin"] for e in dash.teslaVehicles] == ["V1"]
+
+    async def test_exception_marks_unavailable_and_never_raises(self):
+        tesla = _make_tesla()
+        tesla.vehicle_list.side_effect = RuntimeError("boom")
+        with _tesla_dashboard() as dash:
+            await pollTesla(tesla, {})
+            assert dash.teslaAvailable is False
+            assert "boom" in dash.teslaError
+
+    async def test_unauthorized_message_mentions_login(self):
+        with _tesla_dashboard() as dash:
+            await pollTesla(_make_tesla(authorized=False), {})
+            assert dash.teslaAvailable is False
+            assert "--tesla-login" in dash.teslaError
+
+    async def test_no_name_match_reports_error_with_account_names(self):
+        vs = [_FakeTeslaVehicle(vin="V1", name="Karl", state="asleep")]
+        with _tesla_dashboard() as dash:
+            await pollTesla(_make_tesla(vs), {"vehicleNames": ["Nope"]})
+            assert dash.teslaAvailable is False
+            assert "vehicleNames" in dash.teslaError
+            assert "Karl" in dash.teslaError
+
+    async def test_recovery_after_failure(self):
+        tesla = _make_tesla([_FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE)])
+        tesla.vehicle_list.side_effect = [RuntimeError("boom"), tesla.vehicle_list.return_value]
+        with _tesla_dashboard() as dash:
+            await pollTesla(tesla, {})
+            assert dash.teslaAvailable is False
+            await pollTesla(tesla, {})
+            assert dash.teslaAvailable is True
+            assert dash.teslaError is None
+
+
+@pytest.mark.asyncio
+class TestPollAllSitesTeslaStamp:
+    """_pollAllSites stamps VIN-keyed Tesla SOCs into every fresh history entry
+    at construction (before the long-history save, for every successful site)."""
+
+    def _site(self, name="Home"):
+        site = SiteInfo(name=name, pw=None,
+                        pwState=PowerwallState(solarWatts=1000, homeWatts=500, powerwallSocPercent=80))
+        site.lastLongHistoryTime = datetime.now(timezone.utc)  # suppress long-history file save
+        return site
+
+    async def test_stamps_vin_keyed_soc_into_fresh_entry(self):
+        vehicles = [
+            {"vin": "V1", "name": "Karl", "socPercent": 72},
+            {"vin": "V2", "name": "Bella", "socPercent": None},
+        ]
+        site = self._site()
+        with _tesla_dashboard(vehicles=vehicles):
+            await _pollAllSites({"Home": site})
+        assert site.history[-1]["teslaSoc"] == {"V1": 72, "V2": None}
+
+    async def test_all_sites_stamped_with_distinct_dicts(self):
+        siteA, siteB = self._site("A"), self._site("B")
+        with _tesla_dashboard(vehicles=[{"vin": "V1", "name": "Karl", "socPercent": 72}]):
+            await _pollAllSites({"A": siteA, "B": siteB})
+        a, b = siteA.history[-1]["teslaSoc"], siteB.history[-1]["teslaSoc"]
+        assert a == b == {"V1": 72}
+        assert a is not b  # entries persist independently; no shared mutable dict
+
+    async def test_failed_site_gets_no_entry(self):
+        site = self._site()
+        site.error = "boom"
+        with _tesla_dashboard(vehicles=[{"vin": "V1", "name": "Karl", "socPercent": 72}]):
+            await _pollAllSites({"Home": site})
+        assert len(site.history) == 0
+
+    async def test_not_configured_writes_no_key(self):
+        site = self._site()
+        with _tesla_dashboard(configured=False, vehicles=[{"vin": "V1", "name": "Karl", "socPercent": 72}]):
+            await _pollAllSites({"Home": site})
+        assert "teslaSoc" not in site.history[-1]
+
+
+@pytest.mark.asyncio
+class TestWebChartSocTesla:
+    """SOC chart gains one series per Tesla vehicle seen in history."""
+
+    def _make_history(self, n=3, teslaSoc=None):
+        h = collections.deque(maxlen=120)
+        for i in range(n):
+            ts = datetime(2024, 1, 1, 12, i, 0, tzinfo=timezone.utc).isoformat()
+            entry = {
+                "timestamp": ts,
+                "solarWatts": 2000.0,
+                "homeWatts": 800.0,
+                "surplusKw": 1.2,
+                "powerwallSocPercent": 70.0,
+                "evSocPercent": 60.0,
+            }
+            if teslaSoc is not None:
+                entry["teslaSoc"] = teslaSoc
+            h.append(entry)
+        return h
+
+    @contextmanager
+    def _chaos_state(self, site):
+        import chaos
+        orig_history = chaos._dashboard.history
+        orig_sites = chaos._allSites
+        chaos._dashboard.history = site.history
+        chaos._dashboard.activePowerwall = site.name
+        chaos._allSites = {site.name: site}
+        try:
+            yield
+        finally:
+            chaos._dashboard.history = orig_history
+            chaos._dashboard.activePowerwall = ""
+            chaos._allSites = orig_sites
+
+    async def test_soc_chart_includes_tesla_series(self):
+        import chaos
+        site = SiteInfo(name="SiteA", pw=None)
+        site.history = self._make_history(teslaSoc={"TKarl": 72.0, "TBella": 50.0})
+        site.longHistory = self._make_history(teslaSoc={"TKarl": 72.0, "TBella": 50.0})
+        with self._chaos_state(site):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/soc.svg")
+        assert resp.status_code == 200
+        assert "TKarl" in resp.text
+        assert "TBella" in resp.text
+
+    async def test_soc_chart_maps_vin_keys_to_current_names(self):
+        """VIN-keyed entries label with the vehicle's current name; unknown keys
+        (legacy name-keyed entries, removed vehicles) fall back to the key itself."""
+        import chaos
+        site = SiteInfo(name="SiteA", pw=None)
+        site.history = self._make_history(teslaSoc={"5YJVIN000000000X1": 72.0})
+        site.longHistory = self._make_history(teslaSoc={"5YJVIN000000000X1": 72.0})
+        with self._chaos_state(site), _tesla_dashboard(vehicles=[{"vin": "5YJVIN000000000X1", "name": "TKarl", "socPercent": 72}]):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/soc.svg")
+        assert resp.status_code == 200
+        assert "TKarl" in resp.text
+        assert "5YJVIN000000000X1" not in resp.text
+
+    async def test_soc_chart_without_tesla_data_unchanged(self):
+        import chaos
+        site = SiteInfo(name="SiteA", pw=None)
+        site.history = self._make_history()
+        site.longHistory = self._make_history()
+        with self._chaos_state(site):
+            async with AsyncClient(transport=ASGITransport(app=chaos._webApp), base_url="http://test") as client:
+                resp = await client.get("/api/charts/soc.svg")
+        assert resp.status_code == 200
+        assert "TKarl" not in resp.text
+        assert "Lucid" in resp.text  # the Lucid battery series legend
+
+
+class TestTeslaApiStateAndTemplate:
+    def test_api_state_includes_tesla_keys(self):
+        from starlette.testclient import TestClient
+
+        entry = {
+            "vin": "V1", "name": "Karl", "socPercent": 72, "chargeStateName": "Charging",
+            "chargingKw": 11.0, "rangeKm": 160.9, "chargeLimitPercent": 80,
+            "asleep": False, "lastPolled": "2026-01-01T00:00:00+00:00",
+        }
+        with _tesla_dashboard(vehicles=[entry]):
+            with TestClient(_webApp) as client:
+                r = client.get("/api/state")
+        assert r.status_code == 200
+        d = r.json()
+        for key in ("teslaConfigured", "teslaAvailable", "teslaError", "teslaVehicles"):
+            assert key in d, f"Missing key '{key}' in /api/state response"
+        assert d["teslaVehicles"] == [entry]  # JSON-serializable as-is (ISO lastPolled)
+
+    def test_template_contains_tesla_section(self):
+        assert 'id="vehiclesSection"' in _HTML_TEMPLATE
+        assert "tesla-device" in _HTML_TEMPLATE
+        assert "card-tesla-" in _HTML_TEMPLATE
+        assert "teslaVehicles" in _HTML_TEMPLATE
+        # Range card gets the same amber fill treatment as the Lucid range card
+        assert "fillBg('card-tesla-range-'+i" in _HTML_TEMPLATE
+        assert _HTML_TEMPLATE.count("rgba(251,191,36,0.22)") == 2  # Lucid + Tesla range fills match
+
+    def test_headers_show_vehicle_identity(self):
+        # Both vehicle types render identity (model · odometer · fw) on their group
+        # headers through the shared vmeta builder; the old top vinfo line is gone.
+        assert "function vmeta" in _HTML_TEMPLATE
+        assert "vmeta(d.vehicleModel,d.vehicleOdometerKm,d.vehicleSoftwareVersion," in _HTML_TEMPLATE
+        assert "vmeta(v.model,v.odometerKm,v.softwareVersion," in _HTML_TEMPLATE
+        assert 'id="vinfo"' not in _HTML_TEMPLATE
+        assert "vehicle-info" not in _HTML_TEMPLATE
+
+    def test_site_headers_show_bright_name_model_and_firmware(self):
+        assert '<span class="glname">\'+escHtml(site.name)' in _HTML_TEMPLATE
+        assert "vmeta(site.model,null,site.firmwareVersion," in _HTML_TEMPLATE
+
+    def test_site_headers_show_lifetime_energy(self):
+        assert "mwhFmt(site.lifetimeChargedWh)+' in'" in _HTML_TEMPLATE
+        assert "mwhFmt(site.lifetimeDischargedWh)+' out'" in _HTML_TEMPLATE
+
+    def test_site_cards_show_attributed_tesla_charging(self):
+        assert "Tesla Charging" in _HTML_TEMPLATE
+        assert "site.teslaChargingKw" in _HTML_TEMPLATE
+        assert "homeW-=tKw*1000" in _HTML_TEMPLATE  # attributed draw subtracted from home load
+
+    def test_lucid_specific_labels(self):
+        # Charging card, toggle buttons, and chart legends all say Lucid, not generic "EV"
+        assert "Lucid Charging" in _HTML_TEMPLATE
+        assert "Enable Lucid Charging" in _HTML_TEMPLATE
+        assert "Disable Lucid Charging" in _HTML_TEMPLATE
+        assert "EV Charging" not in _HTML_TEMPLATE
+
+    def test_vehicle_headers_start_with_bright_name_then_make(self):
+        assert 'id="evLabel"' in _HTML_TEMPLATE
+        assert "Electric Vehicle" not in _HTML_TEMPLATE
+        # Shared label builder: bright name span first, then the manufacturer
+        assert "vlabel(d.vehicleName,'Lucid')" in _HTML_TEMPLATE
+        assert "vlabel(v.name,'Tesla')" in _HTML_TEMPLATE
+        assert ".card-group-label .glname" in _HTML_TEMPLATE      # bright-name style
+        assert ".glerr .glname{color:inherit}" in _HTML_TEMPLATE  # error red wins over bright name
+
+    def test_two_column_device_layout(self):
+        # Each section is a grid of same-type device tiles; two columns on wide displays
+        assert ".devices{display:grid" in _HTML_TEMPLATE
+        assert "@media(min-width:1350px)" in _HTML_TEMPLATE
+        assert ".devices .device:only-child{grid-column:1/-1}" in _HTML_TEMPLATE
+        assert '<div id="siteRows" class="devices">' in _HTML_TEMPLATE
+        # Lucid and Tesla tiles share one grid so they can sit side by side when they fit
+        assert '<div id="vehiclesSection" class="devices">' in _HTML_TEMPLATE
+        # Both JS builders wrap each device group in a tile
+        assert _HTML_TEMPLATE.count("'<div class=\"device") >= 2
+
+    def test_template_hardening_and_constants(self):
+        assert "const MI=" in _HTML_TEMPLATE
+        assert _HTML_TEMPLATE.count("1.60934") == 1         # single shared mile-conversion constant
+        assert "escHtml(s.replace" in _HTML_TEMPLATE         # badge() escapes external state strings
+        assert "⚠ Tesla unavailable" not in _HTML_TEMPLATE   # banner consolidated into red headers
+
+    def test_group_headers_report_per_device_freshness_and_errors(self):
+        assert ".card-group-label .glmeta" in _HTML_TEMPLATE  # muted data-age suffix style
+        assert ".card-group-label .glerr" in _HTML_TEMPLATE   # red-on-failure style
+        assert "d.lucidError" in _HTML_TEMPLATE               # Lucid failure marks its header
+        assert "ageFmt(v.lastPolled)" in _HTML_TEMPLATE       # per-Tesla data age
+        assert "ageFmt(site.lastPolled)" in _HTML_TEMPLATE    # per-Powerwall data age
+        assert "ageFmt(d.vehicleLastPolled)" in _HTML_TEMPLATE  # Lucid data age
+        assert "EV data: " not in _HTML_TEMPLATE              # old ambiguous label gone
+        assert "card-sub" not in _HTML_TEMPLATE.split("</style>")[1]  # Tesla card sub-line consolidated into header
+
+
+class TestTeslaAuthResponseUrl:
+    _REDIRECT = "tesla://auth/callback"
+
+    def test_full_tesla_url(self):
+        import chaos
+        url = chaos._teslaAuthResponseUrl("tesla://auth/callback?code=abc&state=s", self._REDIRECT, "fallback")
+        assert url == "tesla://auth/callback?code=abc&state=s"
+
+    def test_https_url_normalized_to_redirect_uri(self):
+        import chaos
+        url = chaos._teslaAuthResponseUrl("https://auth.tesla.com/void/callback?code=abc&state=s", self._REDIRECT, "fallback")
+        assert url == "tesla://auth/callback?code=abc&state=s"
+
+    def test_bare_query_string(self):
+        import chaos
+        url = chaos._teslaAuthResponseUrl("code=abc&state=s", self._REDIRECT, "fallback")
+        assert url == "tesla://auth/callback?code=abc&state=s"
+
+    def test_bare_code_value_uses_expected_state(self):
+        import chaos
+        url = chaos._teslaAuthResponseUrl("NA_abc123def456ghi789", self._REDIRECT, "st8")
+        assert url == "tesla://auth/callback?code=NA_abc123def456ghi789&state=st8"
+
+    def test_login_url_rejected(self):
+        import chaos
+        url = "https://auth.tesla.com/oauth2/v3/authorize?response_type=code&code_challenge=xyz"
+        assert chaos._teslaAuthResponseUrl(url, self._REDIRECT, "s") is None
+
+    def test_short_or_empty_rejected(self):
+        import chaos
+        assert chaos._teslaAuthResponseUrl("", self._REDIRECT, "s") is None
+        assert chaos._teslaAuthResponseUrl("abc", self._REDIRECT, "s") is None
+        assert chaos._teslaAuthResponseUrl("tesla://auth/callback", self._REDIRECT, "s") is None
+
+
+class TestEnsureTeslaCacheFile:
+    def test_creates_empty_cache_with_restricted_perms(self, tmp_path, monkeypatch):
+        import chaos
+        cache = tmp_path / "tesla_token_cache.json"
+        monkeypatch.setattr(chaos, "_TESLA_CACHE_FILE", cache)
+        chaos._ensureTeslaCacheFile()
+        assert cache.read_text() == "{}"
+        assert (cache.stat().st_mode & 0o777) == 0o600
+
+    def test_leaves_existing_cache_alone(self, tmp_path, monkeypatch):
+        import chaos
+        cache = tmp_path / "tesla_token_cache.json"
+        cache.write_text('{"e@e.com": {"sso": {}}}')
+        monkeypatch.setattr(chaos, "_TESLA_CACHE_FILE", cache)
+        chaos._ensureTeslaCacheFile()
+        assert cache.read_text() == '{"e@e.com": {"sso": {}}}'
+
+
+class TestTeslaLoginCLI:
+    _AUTH_URL = "https://auth.tesla.com/oauth2/v3/authorize?response_type=code&code_challenge=xyz&state=st8"
+    _GOOD_REDIRECT = "tesla://auth/callback?code=abc&state=s"
+
+    @staticmethod
+    def _mockTesla(TeslaCls):
+        tesla = TeslaCls.return_value
+        tesla.authorized = False
+        tesla.authorization_url.return_value = TestTeslaLoginCLI._AUTH_URL
+        tesla.redirect_uri = "tesla://auth/callback"
+        return tesla
+
+    @pytest.fixture(autouse=True)
+    def _tmp_cache(self, tmp_path, monkeypatch):
+        import chaos
+        monkeypatch.setattr(chaos, "_TESLA_CACHE_FILE", tmp_path / "tesla_token_cache.json")
+
+    def test_missing_email_exits(self):
+        with pytest.raises(SystemExit, match="tesla"):
+            teslaInteractiveLogin({"tesla": {}})
+
+    def test_already_authorized_skips_fetch(self, capsys):
+        with patch("chaos.teslapy.Tesla") as TeslaCls:
+            TeslaCls.return_value.authorized = True
+            teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+        TeslaCls.return_value.fetch_token.assert_not_called()
+        assert "Already authorized" in capsys.readouterr().out
+
+    def test_login_flow_fetches_token(self, capsys):
+        """A pasted redirect URL is passed as authorization_response — never code=,
+        which would make teslapy regenerate the PKCE verifier the code is bound to."""
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", return_value=" " + self._GOOD_REDIRECT + " "):
+            tesla = self._mockTesla(TeslaCls)
+            teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+        tesla.fetch_token.assert_called_once_with(authorization_response="tesla://auth/callback?code=abc&state=s")
+
+    def test_bare_code_paste_accepted(self):
+        """A bare authorization code (e.g. from DevTools) works; the state comes
+        from the authorization URL generated this run."""
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", return_value="NA_abc123def456ghi789"):
+            tesla = self._mockTesla(TeslaCls)
+            teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+        tesla.fetch_token.assert_called_once_with(
+            authorization_response="tesla://auth/callback?code=NA_abc123def456ghi789&state=st8")
+
+    def test_pasted_login_url_reprompts_then_succeeds(self, capsys):
+        """Pasting the authorize URL (no code param, but code_challenge=) must re-prompt, not crash."""
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", side_effect=[self._AUTH_URL, self._GOOD_REDIRECT]):
+            tesla = self._mockTesla(TeslaCls)
+            teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+        tesla.fetch_token.assert_called_once_with(authorization_response="tesla://auth/callback?code=abc&state=s")
+        assert "No authorization code" in capsys.readouterr().out
+
+    def test_three_bad_urls_exit(self):
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", side_effect=[self._AUTH_URL] * 3):
+            tesla = TeslaCls.return_value
+            tesla.authorized = False
+            tesla.authorization_url.return_value = self._AUTH_URL
+            with pytest.raises(SystemExit, match="3 attempts"):
+                teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+        tesla.fetch_token.assert_not_called()
+
+    def test_fetch_token_failure_exits_cleanly(self):
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", return_value=self._GOOD_REDIRECT):
+            tesla = TeslaCls.return_value
+            tesla.authorized = False
+            tesla.authorization_url.return_value = self._AUTH_URL
+            tesla.fetch_token.side_effect = RuntimeError("invalid_grant")
+            with pytest.raises(SystemExit, match="Token exchange failed.*invalid_grant"):
+                teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+
+    def test_eof_on_input_exits_cleanly(self):
+        with patch("chaos.teslapy.Tesla") as TeslaCls, patch("builtins.input", side_effect=EOFError):
+            tesla = TeslaCls.return_value
+            tesla.authorized = False
+            tesla.authorization_url.return_value = self._AUTH_URL
+            with pytest.raises(SystemExit, match="Aborted"):
+                teslaInteractiveLogin({"tesla": {"email": "e@e.com"}})
+
+    def test_main_dispatches_tesla_login(self):
+        import chaos
+        with patch("sys.argv", ["chaos.py", "--tesla-login"]), \
+             patch("chaos.loadConfig", return_value={"tesla": {"email": "e@e.com"}}), \
+             patch("chaos.teslaInteractiveLogin") as login, \
+             patch("chaos.asyncio.run") as run:
+            chaos.main()
+        login.assert_called_once()
+        run.assert_not_called()
+
+
+def _make_loop_test_config(**overrides):
+    """Config for runChaos loop tests: single site named 'test', EV poll due every
+    cycle, web server disabled. Built on the canonical _make_valid_config."""
+    return _make_valid_config(
+        activePowerwall="test",
+        powerwalls=[_make_pw_entry(name="test", host="192.168.1.1")],
+        notifications={"enabled": False},
+        pollingIntervalSeconds=0,
+        dashboard={"port": None},
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+class TestLucidErrorAttribution:
+    """A processCycle failure sets _dashboard.lucidError; the next success clears it."""
+
+    async def test_lucid_error_set_on_failure_cleared_on_success(self):
+        import chaos
+        from chaos import runChaos
+
+        config = _make_loop_test_config()
+        lucid_mock, _ = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        call_count = [0]
+        observed = []  # lucidError value at the START of each cycle
+
+        async def mock_poll(allSites):
+            call_count[0] += 1
+            site = allSites["test"]
+            site.error = None
+            site.pwState.update(1000, 500, 80)
+            observed.append(chaos._dashboard.lucidError)
+            if call_count[0] >= 3:
+                raise asyncio.CancelledError
+
+        cached = MagicMock()
+        cached.lastCommandTime = None
+        cached.chargeState = CS.CHARGE_STATE_CABLE_CONNECTED
+        cached.evChargingAmps = 0
+        ev_calls = [0]
+
+        async def mock_process_cycle(*args, **kwargs):
+            ev_calls[0] += 1
+            if ev_calls[0] == 1:
+                raise RuntimeError("lucid down")
+            return cached, 1
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        chaos._dashboard.lucidError = None
+        try:
+            with (
+                patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+                patch("chaos.LucidAPI") as MockLucidAPI,
+                patch("chaos._pollAllSites", new=mock_poll),
+                patch("chaos.processCycle", new=mock_process_cycle),
+                patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+            ):
+                MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+                MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+                # Fresh event bound to this test's loop (see TestDecoupledPolling)
+                with patch.object(chaos, "_forcePoll", asyncio.Event()):
+                    await runChaos(config)
+
+            assert ev_calls[0] == 2
+            # cycle 1 start: no error yet; cycle 2 start: failure recorded;
+            # cycle 3 start: cleared by cycle 2's successful poll
+            assert observed == [None, "lucid down", None]
+            assert chaos._dashboard.lucidError is None
+        finally:
+            chaos._dashboard.lucidError = None
+            chaos._dashboard.lastError = None
+
+    async def test_tesla_and_site_readings_survive_lucid_outage(self):
+        """siteReadings and the Tesla poll run before the decision chain, so a
+        processCycle failure on EVERY cycle must not starve them."""
+        import chaos
+        from chaos import runChaos
+
+        config = _make_loop_test_config(tesla={"email": "e@e.com"})
+        lucid_mock, _ = _make_lucid_mock()
+        lucid_mock.login = AsyncMock()
+
+        call_count = [0]
+
+        async def mock_poll(allSites):
+            call_count[0] += 1
+            site = allSites["test"]
+            site.error = None
+            site.pwState.update(1000, 500, 80)
+            if call_count[0] >= 3:
+                raise asyncio.CancelledError
+
+        async def mock_process_cycle(*args, **kwargs):
+            raise RuntimeError("lucid down")  # fails every cycle
+
+        tesla_polls = [0]
+
+        async def mock_poll_tesla(tesla, teslaConfig):
+            tesla_polls[0] += 1
+
+        pw_mock = MagicMock()
+        pw_mock.is_connected.return_value = True
+
+        chaos._dashboard.siteReadings = []
+        chaos._dashboard.lucidError = None
+        try:
+            with (
+                patch("chaos.pypowerwall.Powerwall", return_value=pw_mock),
+                patch("chaos.LucidAPI") as MockLucidAPI,
+                patch("chaos.teslapy.Tesla", return_value=MagicMock()),
+                patch("chaos._pollAllSites", new=mock_poll),
+                patch("chaos.processCycle", new=mock_process_cycle),
+                patch("chaos.pollTesla", new=mock_poll_tesla),
+                patch("chaos._PW_POLLING_INTERVAL_S", 0.001),
+            ):
+                MockLucidAPI.return_value.__aenter__ = AsyncMock(return_value=lucid_mock)
+                MockLucidAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+                with patch.object(chaos, "_forcePoll", asyncio.Event()):
+                    await runChaos(config)
+
+            assert tesla_polls[0] == 1  # first cycle polled Tesla (later cycles: 5-min timer not due)
+            assert chaos._dashboard.siteReadings and chaos._dashboard.siteReadings[0]["name"] == "test"
+            assert chaos._dashboard.lucidError == "lucid down"
+        finally:
+            chaos._dashboard.lucidError = None
+            chaos._dashboard.lastError = None
+            chaos._dashboard.siteReadings = []
+            chaos._dashboard.teslaConfigured = False
+            chaos._dashboard.teslaVehicles = []
+
+
+class TestReadPowerwallInfo:
+    """Best-effort battery model (from battery_blocks part numbers — NOT the gateway
+    DIN, which identifies the Backup Gateway) and firmware version."""
+
+    def _pw(self, partNumbers, version="25.10.1"):
+        pw = MagicMock()
+        pw.system_status.return_value = {
+            "battery_blocks": [{"PackagePartNumber": p, "PackageSerialNumber": f"TG{i}"}
+                               for i, p in enumerate(partNumbers)]
+        }
+        pw.version.return_value = version
+        return pw
+
+    def test_single_powerwall_2(self):
+        import chaos
+        assert chaos._readPowerwallInfo(self._pw(["2012170-25-E"])) == ("Powerwall 2", "25.10.1")
+
+    def test_version_build_hash_stripped(self):
+        import chaos
+        _, version = chaos._readPowerwallInfo(self._pw(["2012170-25-E"], version="26.18.1 fabf8f5a"))
+        assert version == "26.18.1"
+
+    def test_multiple_identical_batteries_counted(self):
+        import chaos
+        model, _ = chaos._readPowerwallInfo(self._pw(["2012170-25-E", "3012170-05-B"]))
+        assert model == "2× Powerwall 2"
+
+    def test_powerwall_3(self):
+        import chaos
+        model, _ = chaos._readPowerwallInfo(self._pw(["1707000-11-J"]))
+        assert model == "Powerwall 3"
+
+    def test_mixed_models_joined(self):
+        import chaos
+        model, _ = chaos._readPowerwallInfo(self._pw(["2012170-25-E", "1707000-11-J"]))
+        assert model == "Powerwall 2 + Powerwall 3"
+
+    def test_unknown_part_number_yields_no_model(self):
+        import chaos
+        assert chaos._readPowerwallInfo(self._pw(["9999999-00-X"], version="23.44.0")) == (None, "23.44.0")
+
+    def test_gateway_din_not_used(self):
+        import chaos
+        pw = self._pw(["2012170-25-E"])
+        chaos._readPowerwallInfo(pw)
+        pw.din.assert_not_called()  # 1232100-prefixed gateway DINs mislabel PW2 sites
+
+    def test_errors_never_raise(self):
+        import chaos
+        pw = MagicMock()
+        pw.system_status.side_effect = RuntimeError("boom")
+        pw.version.side_effect = RuntimeError("boom")
+        assert chaos._readPowerwallInfo(pw) == (None, None)
+
+    def test_missing_battery_blocks_and_empty_version(self):
+        import chaos
+        pw = MagicMock()
+        pw.system_status.return_value = {}
+        pw.version.return_value = ""
+        assert chaos._readPowerwallInfo(pw) == (None, None)
+
+
+@pytest.mark.asyncio
+class TestPollOneSiteLifetimeEnergy:
+    """_pollOneSite captures lifetime battery energy counters from the verbose meter."""
+
+    def _pw(self, battery):
+        pw = MagicMock()
+        pw.solar.return_value = 2000
+        pw.home.return_value = 800
+        pw.level.return_value = 75.0
+        pw.battery.return_value = battery
+        return pw
+
+    async def test_counters_captured_on_success(self):
+        site = SiteInfo(name="Home", pw=self._pw({"instant_power": -1200,
+                                                  "energy_imported": 18_200_000,
+                                                  "energy_exported": 17_100_000}))
+        assert await _pollOneSite(site) is True
+        assert site.lifetimeChargedWh == 18_200_000
+        assert site.lifetimeDischargedWh == 17_100_000
+        site.pw.battery.assert_called_with(verbose=True)
+
+    async def test_non_dict_battery_leaves_counters_alone(self):
+        site = SiteInfo(name="Home", pw=self._pw(None))
+        assert await _pollOneSite(site) is True
+        assert site.lifetimeChargedWh is None
+        assert site.lifetimeDischargedWh is None
+
+    async def test_zero_counters_treated_as_unavailable(self):
+        """TEDAPI mode stubs the lifetime counters as 0 — don't display '0 kWh'."""
+        site = SiteInfo(name="Home", pw=self._pw({"instant_power": -1200,
+                                                  "energy_imported": 0,
+                                                  "energy_exported": 0}))
+        assert await _pollOneSite(site) is True
+        assert site.lifetimeChargedWh is None
+        assert site.lifetimeDischargedWh is None
+
+
+class TestSiteTeslaCandidateKw:
+    """Per-site conditions for hosting the Tesla charging draw (display only)."""
+
+    _NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _site(self, homeWatts=8000.0, solarWatts=8200.0, polledOffsetS=0, withHistory=True):
+        site = SiteInfo(name="Home", pw=None,
+                        pwState=PowerwallState(solarWatts=solarWatts, homeWatts=homeWatts, powerwallSocPercent=80))
+        if withHistory:
+            ts = (self._NOW + timedelta(seconds=polledOffsetS)).isoformat()
+            site.history.append({"timestamp": ts})
+        return site
+
+    def _vehicle(self, chargingKw=7.0, asleep=False, polledOffsetS=0, vin="V1"):
+        return {"vin": vin, "name": "Karl", "chargingKw": chargingKw, "asleep": asleep,
+                "lastPolled": (self._NOW + timedelta(seconds=polledOffsetS)).isoformat()}
+
+    def test_happy_path(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[self._vehicle(chargingKw=7.0)]):
+            assert chaos._siteTeslaCandidateKw(self._site(), False) == 7.0
+
+    def test_stale_tesla_poll_not_attributed(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[self._vehicle(polledOffsetS=-151)]):
+            assert chaos._siteTeslaCandidateKw(self._site(), False) == 0.0
+
+    def test_within_window_attributed(self):
+        import chaos
+        # 150s window tolerates one glitched/missed poll at the 60s charging cadence
+        with _tesla_dashboard(vehicles=[self._vehicle(polledOffsetS=-149)]):
+            assert chaos._siteTeslaCandidateKw(self._site(), False) == 7.0
+
+    def test_home_load_too_small(self):
+        import chaos
+        # home 7.4kW < 7.0 + 0.5 margin
+        with _tesla_dashboard(vehicles=[self._vehicle(chargingKw=7.0)]):
+            assert chaos._siteTeslaCandidateKw(self._site(homeWatts=7400, solarWatts=7500), False) == 0.0
+
+    def test_surplus_outside_band(self):
+        import chaos
+        # surplus = (12000-8000)/1000 = 4kW — not the charge-on-solar signature
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            assert chaos._siteTeslaCandidateKw(self._site(solarWatts=12000), False) == 0.0
+
+    def test_active_site_with_lucid_charging_excluded(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            chaos._dashboard.evChargingKw = 5.0
+            try:
+                assert chaos._siteTeslaCandidateKw(self._site(), True) == 0.0
+                assert chaos._siteTeslaCandidateKw(self._site(), False) == 7.0  # non-active unaffected
+            finally:
+                chaos._dashboard.evChargingKw = 0.0
+
+    def test_asleep_and_idle_vehicles_excluded_charging_summed(self):
+        import chaos
+        vehicles = [
+            self._vehicle(chargingKw=7.0, vin="V1"),
+            self._vehicle(chargingKw=3.0, vin="V2"),
+            self._vehicle(chargingKw=5.0, asleep=True, vin="V3"),
+            self._vehicle(chargingKw=0.0, vin="V4"),
+        ]
+        with _tesla_dashboard(vehicles=vehicles):
+            assert chaos._siteTeslaCandidateKw(self._site(homeWatts=11000, solarWatts=11200), False) == 10.0
+
+    def test_not_configured_or_no_history(self):
+        import chaos
+        with _tesla_dashboard(configured=False, vehicles=[self._vehicle()]):
+            assert chaos._siteTeslaCandidateKw(self._site(), False) == 0.0
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            assert chaos._siteTeslaCandidateKw(self._site(withHistory=False), False) == 0.0
+
+
+class TestTeslaPollDelay:
+    def test_faster_while_charging(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[{"vin": "V1", "name": "K", "chargingKw": 7.0, "asleep": False, "lastPolled": None}]):
+            assert chaos._teslaPollDelayS(300) == 60
+
+    def test_configured_interval_when_idle_or_asleep(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[{"vin": "V1", "name": "K", "chargingKw": 0.0, "asleep": False, "lastPolled": None},
+                                        {"vin": "V2", "name": "B", "chargingKw": 7.0, "asleep": True, "lastPolled": None}]):
+            assert chaos._teslaPollDelayS(300) == 300
+
+    def test_never_slower_than_configured(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[{"vin": "V1", "name": "K", "chargingKw": 7.0, "asleep": False, "lastPolled": None}]):
+            assert chaos._teslaPollDelayS(30) == 30
+
+    def test_poll_jitter_constant_sane(self):
+        import chaos
+        # Due-time tolerance must exist and be small relative to the charging cadence,
+        # so a cycle on the nominal boundary polls instead of skipping (120s gaps).
+        assert 0 < chaos._TESLA_POLL_JITTER_S < chaos._TESLA_CHARGING_POLL_INTERVAL_S
+
+
+class TestAttributedTeslaSite:
+    """A single Tesla can only charge at one site — attribution picks at most one,
+    then holds it for the whole charging session."""
+
+    _NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    @pytest.fixture(autouse=True)
+    def _reset_hold(self):
+        import chaos
+        chaos._teslaAttrSiteName = None
+        yield
+        chaos._teslaAttrSiteName = None
+
+    def _site(self, name, homeWatts, solarWatts):
+        site = SiteInfo(name=name, pw=None,
+                        pwState=PowerwallState(solarWatts=solarWatts, homeWatts=homeWatts, powerwallSocPercent=80))
+        site.history.append({"timestamp": self._NOW.isoformat()})
+        return site
+
+    def _vehicle(self, chargingKw=7.0):
+        return {"vin": "V1", "name": "Karl", "chargingKw": chargingKw, "asleep": False,
+                "lastPolled": self._NOW.isoformat()}
+
+    def test_two_qualifying_sites_only_highest_home_attributed(self):
+        import chaos
+        # Both fit the signature; siteB carries the bigger load → it hosts the Tesla
+        siteA = self._site("A", homeWatts=8000, solarWatts=8200)
+        siteB = self._site("B", homeWatts=9500, solarWatts=9600)
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            name, kw = chaos._attributedTeslaSite({"A": siteA, "B": siteB}, "A")
+            assert (name, kw) == ("B", 7.0)
+            readings = chaos._buildSiteReadings({"A": siteA, "B": siteB}, "A")
+        byName = {r["name"]: r["teslaChargingKw"] for r in readings}
+        assert byName == {"A": 0.0, "B": 7.0}  # never both
+
+    def test_single_qualifier_attributed_regardless_of_home(self):
+        import chaos
+        siteA = self._site("A", homeWatts=3000, solarWatts=12000)  # surplus 9kW → disqualified
+        siteB = self._site("B", homeWatts=8000, solarWatts=8200)
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            assert chaos._attributedTeslaSite({"A": siteA, "B": siteB}, "A") == ("B", 7.0)
+
+    def test_no_qualifiers(self):
+        import chaos
+        siteA = self._site("A", homeWatts=3000, solarWatts=12000)
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            assert chaos._attributedTeslaSite({"A": siteA}, "A") == (None, 0.0)
+
+    def test_active_site_excluded_by_charge_state_during_stop_lag(self):
+        import chaos
+        # Lucid amps zeroed after STOP but the API still reports CHARGING: the
+        # active site must not be a candidate; a non-active site is unaffected.
+        site = self._site("A", homeWatts=8000, solarWatts=8200)
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            origState = chaos._dashboard.chargeStateName
+            chaos._dashboard.evChargingKw = 0.0
+            chaos._dashboard.chargeStateName = "CHARGE_STATE_CHARGING"
+            try:
+                assert chaos._siteTeslaCandidateKw(site, True) == 0.0
+                assert chaos._siteTeslaCandidateKw(site, False) == 7.0
+            finally:
+                chaos._dashboard.chargeStateName = origState
+
+
+class TestTeslaAttributionHysteresis:
+    """Once attributed, the session holds through transients and releases only
+    when the Tesla actually stops (or data goes stale / Lucid takes the site)."""
+
+    _NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    @pytest.fixture(autouse=True)
+    def _reset_hold(self):
+        import chaos
+        chaos._teslaAttrSiteName = None
+        yield
+        chaos._teslaAttrSiteName = None
+
+    def _site(self, name="B", homeWatts=8000, solarWatts=8200):
+        site = SiteInfo(name=name, pw=None,
+                        pwState=PowerwallState(solarWatts=solarWatts, homeWatts=homeWatts, powerwallSocPercent=80))
+        site.history.append({"timestamp": self._NOW.isoformat()})
+        return site
+
+    def _vehicle(self, chargingKw=7.0, polledOffsetS=0):
+        return {"vin": "V1", "name": "Karl", "chargingKw": chargingKw, "asleep": False,
+                "lastPolled": (self._NOW + timedelta(seconds=polledOffsetS)).isoformat()}
+
+    def _enter(self, chaos, site):
+        assert chaos._attributedTeslaSite({site.name: site}, "other") == (site.name, 7.0)
+
+    def test_hold_survives_surplus_excursion(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            self._enter(chaos, site)
+            # Cloud/solar drop: surplus -6kW would fail the entry band
+            site.pwState.update(2000, 8000, 80)
+            assert chaos._attributedTeslaSite({site.name: site}, "other") == ("B", 7.0)
+
+    def test_hold_survives_home_spike(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            self._enter(chaos, site)
+            # Appliance spike: home 15kW breaks the entry margin band but not the hold
+            site.pwState.update(8200, 15000, 80)
+            assert chaos._attributedTeslaSite({site.name: site}, "other") == ("B", 7.0)
+
+    def test_release_when_charging_stops(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]) as dash:
+            self._enter(chaos, site)
+            dash.teslaVehicles = [dict(self._vehicle(), chargingKw=0.0)]
+            assert chaos._attributedTeslaSite({site.name: site}, "other") == (None, 0.0)
+            assert chaos._teslaAttrSiteName is None
+
+    def test_release_when_data_stale(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]) as dash:
+            self._enter(chaos, site)
+            dash.teslaVehicles = [self._vehicle(polledOffsetS=-151)]
+            assert chaos._attributedTeslaSite({site.name: site}, "other") == (None, 0.0)
+
+    def test_release_when_lucid_starts_on_site(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            self._enter(chaos, site)
+            chaos._dashboard.evChargingKw = 5.0
+            try:
+                name, kw = chaos._attributedTeslaSite({site.name: site}, site.name)  # site becomes active
+                assert (name, kw) == (None, 0.0)
+            finally:
+                chaos._dashboard.evChargingKw = 0.0
+
+    def test_release_when_home_below_draw(self):
+        import chaos
+        site = self._site()
+        with _tesla_dashboard(vehicles=[self._vehicle()]):
+            self._enter(chaos, site)
+            site.pwState.update(8200, 3000, 80)  # home 3kW < 7kW draw — car left / wrong site
+            assert chaos._attributedTeslaSite({site.name: site}, "other")[0] is None
+
+    def test_reentry_after_release(self):
+        import chaos
+        siteA = self._site("A")
+        siteB = self._site("B")
+        with _tesla_dashboard(vehicles=[self._vehicle()]) as dash:
+            self._enter(chaos, siteA)
+            dash.teslaVehicles = [dict(self._vehicle(), chargingKw=0.0)]
+            assert chaos._attributedTeslaSite({"A": siteA, "B": siteB}, "other") == (None, 0.0)
+            dash.teslaVehicles = [self._vehicle()]
+            siteB.pwState.update(9600, 9500, 80)  # B now the stronger candidate
+            assert chaos._attributedTeslaSite({"A": siteA, "B": siteB}, "other") == ("B", 7.0)
+
+
+@pytest.mark.asyncio
+class TestTeslaGlitchGrace:
+    """Cars don't sleep mid-charge: transient non-online reports keep last-known state."""
+
+    def _charging_prev(self):
+        return {"vin": "VIN1", "name": "Karl", "socPercent": 60, "chargeStateName": "Charging",
+                "chargingKw": 7.0, "rangeKm": 200.0, "chargeLimitPercent": 80,
+                "model": "Model X Plaid", "odometerKm": 1000.0, "softwareVersion": "2026.20",
+                "asleep": False, "glitchPolls": 0, "lastPolled": "2026-07-17T12:00:00+00:00"}
+
+    async def test_glitch_keeps_awake_charging_state(self):
+        import chaos
+        asleepReport = _FakeTeslaVehicle(state="asleep")
+        with _tesla_dashboard(vehicles=[self._charging_prev()]) as dash:
+            await pollTesla(_make_tesla([asleepReport]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["asleep"] is False
+            assert entry["chargingKw"] == 7.0
+            assert entry["glitchPolls"] == 1
+            assert chaos._teslaPollDelayS(300) == 60  # fast cadence survives the glitch
+
+    async def test_grace_expires_after_limit(self):
+        import chaos
+        with _tesla_dashboard(vehicles=[self._charging_prev()]) as dash:
+            for i in range(chaos._TESLA_CHARGING_GRACE_POLLS + 1):
+                await pollTesla(_make_tesla([_FakeTeslaVehicle(state="asleep")]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["asleep"] is True  # limit exceeded — accept the sleep
+
+    async def test_good_read_resets_glitch_counter(self):
+        with _tesla_dashboard(vehicles=[dict(self._charging_prev(), glitchPolls=2)]) as dash:
+            await pollTesla(_make_tesla([_FakeTeslaVehicle(chargeState=_ONLINE_CHARGE_STATE)]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["glitchPolls"] == 0
+            assert entry["asleep"] is False
+
+    async def test_idle_car_sleeps_immediately(self):
+        with _tesla_dashboard(vehicles=[dict(self._charging_prev(), chargingKw=0.0)]) as dash:
+            await pollTesla(_make_tesla([_FakeTeslaVehicle(state="asleep")]), {})
+            (entry,) = dash.teslaVehicles
+            assert entry["asleep"] is True  # not charging — normal sleep, no grace
